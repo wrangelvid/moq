@@ -205,16 +205,20 @@ both orders from one upstream subscription, it asks upstream for newest first, a
 still sends each subscriber its groups in that subscriber's own order. Over
 moq-transport the upstream order is fixed by whichever subscriber arrived first.
 
-Max delay is measured on the media timeline, not the wall clock, so a backlog
-delivered as a burst is still late while a congestion stall never expires
-anything on its own. Both ends apply it: the publisher skips a group rather
-than sending it, and the subscriber skips it again as it reads, since the
-publisher only ever sees the most tolerant budget across its subscribers.
+A group is late once either clock says so: its successor arrived that long
+ago, or the media timeline has moved that far past where the successor
+begins. The media clock catches a backlog delivered as a burst; the wall clock
+catches a publisher whose timestamps stall. Counting from the successor's
+arrival means a congestion stall that holds the successor back expires
+nothing, and the newest group never expires. Both ends apply it: the publisher
+skips a group rather than sending it, and the subscriber skips it again as it
+reads, since the publisher only ever sees the most tolerant budget across its
+subscribers.
 
 A track is timed or untimed: it declares a timescale or none, and a frame that
 doesn't match is refused. No receiver fills in an arrival time. An untimed
-group never falls past max delay, so a new subscriber starts at its latest
-group unless it names a start. Tracks from moq-lite before 05, or from
+group goes by the wall clock alone, so a new subscriber starts at the oldest
+group its max delay still holds, the latest one at zero. Tracks from moq-lite before 05, or from
 moq-transport without a `TIMESCALE` (every track on drafts 14-16), arrive
 untimed. No moq-lite version can declare an untimed track, so on 05 and later
 its frames go out stamped with their send time.
@@ -227,9 +231,10 @@ nothing from it until the source answers again.
 The publisher may declare a retention window per track. Omission sets no limit;
 zero keeps only the live edge. Relays preserve that declaration, and may still
 evict sooner under their own cache ceiling. Media tracks explicitly use 30
-seconds so a segmented egress can still find its segments. Retention uses media
-timestamps and always keeps the newest group. IETF carries the same idea as
-`MAX_CACHE_DURATION`, measured in wall time, which is only an approximate match.
+seconds so a segmented egress can still find its segments. Retention follows
+the max delay rule and always keeps the newest group. IETF carries the same
+idea as `MAX_CACHE_DURATION`, measured from each object's receipt, which is
+only an approximate match.
 
 Put together, a conference might use:
 

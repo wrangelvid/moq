@@ -1088,7 +1088,7 @@ mod test {
 	use futures::FutureExt;
 
 	use super::*;
-	use crate::{Timestamp, broadcast};
+	use crate::{Timestamp, broadcast, cache};
 
 	/// A route's copy of the track.
 	fn copy() -> track::Producer {
@@ -1338,6 +1338,70 @@ mod test {
 		let mut group = b.create_group(group::Info { sequence: 3 }).unwrap();
 		group.write_frame(ts(3000), b"b".as_ref()).unwrap();
 		assert!(matches!(reading.read_frame().now_or_never(), Some(Err(Error::Old))));
+	}
+
+	/// An untimed group no route continues is given up by the wall clock alone: its
+	/// successor in the serving copy arrived the reader's budget ago and nothing wrote
+	/// since. Against a cold route, whose recovery fetch stays pending, and against one
+	/// whose copy already caches groups past it, so its cursor running ahead hides nothing.
+	#[test]
+	fn an_untimed_group_no_route_continues_is_given_up_by_the_wall_clock() {
+		for cached in [false, true] {
+			let untimed = crate::track::Info::default;
+			let routes = Producer::new();
+			let logical = track::Request::new(Arc::new(broadcast::Info::default()), "video")
+				.routes(routes.consume())
+				.accept(untimed());
+			let a = track::Producer::new(Arc::new(broadcast::Info::default()), "video", untimed());
+			routes.serve(a.consume());
+			let mut sub = subscribe(&logical, Duration::from_millis(100));
+			let mut open = a.create_group(group::Info { sequence: 0 }).unwrap();
+			open.write_frame(None, b"a".as_ref()).unwrap();
+			let mut reading = recv(&mut sub);
+			assert_eq!(read(&mut reading), Some(b"a".to_vec()));
+
+			let pool = cache::Pool::new(cache::Config::default().with_expiry(cache::DEFAULT_EXPIRY));
+			let start = crate::model::clock::now();
+			pool.gc(start);
+			let info = broadcast::Info {
+				pool: pool.clone(),
+				..Default::default()
+			};
+			let b = track::Producer::new(Arc::new(info), "video", untimed());
+			let _dynamic = b.dynamic();
+			let land = |sequence| {
+				let mut group = b.create_group(group::Info { sequence }).unwrap();
+				group.write_frame(None, b"b".as_ref()).unwrap();
+				group
+			};
+			let mut landed = Vec::new();
+			if cached {
+				landed.extend([land(1), land(2)]);
+			}
+			routes.serve(b.consume());
+			let wake = Arc::new(Wake::default());
+			let waiter = kio::Waiter::new(wake.clone().into());
+			assert!(reading.poll_read_frame(&waiter).is_pending());
+			if !cached {
+				landed.push(land(1));
+			}
+			// The pass right after the landing dates it.
+			pool.gc(start);
+			assert!(reading.poll_read_frame(&waiter).is_pending(), "cached: {cached}");
+
+			wake.0.store(false, std::sync::atomic::Ordering::Relaxed);
+			pool.gc(start + Duration::from_millis(99));
+			assert!(!wake.0.load(std::sync::atomic::Ordering::Relaxed), "cached: {cached}");
+			pool.gc(start + Duration::from_millis(100));
+			assert!(
+				wake.0.load(std::sync::atomic::Ordering::Relaxed),
+				"cached: {cached}: only the wall deadline can release the reader"
+			);
+			assert!(
+				matches!(reading.poll_read_frame(&waiter), Poll::Ready(Err(Error::Old))),
+				"cached: {cached}"
+			);
+		}
 	}
 
 	#[test]

@@ -826,7 +826,7 @@ pub struct Options {
 	/// Shared group pool and per-track retention ceiling.
 	///
 	/// `None` uses an unbounded pool with the standard LRU window and no
-	/// media-timestamp ceiling.
+	/// retention ceiling.
 	pub cache: Option<crate::cache::Cache>,
 }
 

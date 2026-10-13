@@ -1501,7 +1501,11 @@ mod tests {
 	#[tokio::test]
 	async fn open_gop_leading_pictures_above_the_previous_group_are_accepted() {
 		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
-		let mut consumer = Consumer::new(track.subscribe(None), Container::Legacy(crate::container::Kind::Data));
+		let subscription = moq_net::track::Subscription::default().with_max_delay(Duration::from_secs(2));
+		let mut consumer = Consumer::new(
+			track.subscribe(subscription),
+			Container::Legacy(crate::container::Kind::Data),
+		);
 		write_group(&mut track, 0, &[ts(0), ts(33_000)]);
 		write_group(&mut track, 1, &[ts(66_000), ts(50_000)]);
 		track.finish().unwrap();

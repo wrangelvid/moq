@@ -637,26 +637,32 @@ Expiration only removes the group from live delivery; the publisher MAY still re
 It is not crucial to aggressively expire groups thanks to [prioritization](#prioritization), but a lower priority group still consumes RAM, bandwidth, and potentially flow control.
 It is RECOMMENDED that an application set conservative limits and only resort to expiration when data is absolutely no longer needed.
 
-A group is never expired until a later group (by sequence number) has presented a frame.
-Once one has, the group's **timestamp age** is the difference between the *newest* frame timestamp of the latest group that has at least one frame, and this group's **reach**, defined below; the group is expired once that age meets the relevant `Max Age`.
-Timestamps are the only measure: they are consistent across relays and unaffected by buffering or jitter.
-Wall-clock reclamation of idle content is the retention cache's own policy (`Publisher Max Age`, or any implementation-defined bound), not part of this rule.
+A group is judged by its **successor**: the next group by sequence number that the endpoint can deliver, not one reset or only fetched.
+A group without one, such as the latest group, is never expired.
+Otherwise the group has two ages, and is expired once either meets the relevant `Max Age`:
 
-A group is expired only once it **provably cannot overlap the Max Age window**: every frame it could still present is older than the budget allows.
+- Its **arrival age** is the time since its successor became available at this endpoint, by the endpoint's own clock. A later successor arriving first starts it, and an earlier one arriving restarts it.
+- Its **timestamp age** is the difference between the *newest* frame timestamp of the latest group that has at least one frame, and this group's **reach**, defined below.
+
+An untimed Track has only the arrival age.
+The arrival age bounds a publisher whose timestamps stop advancing; the timestamp age expires a burst of old groups delivered at once, which the arrival age would keep.
+Starting the clock at the successor rather than the group means a stall that holds the successor back ages nothing.
+Reclaiming idle content, including the latest group once the Track ends, remains the cache's own policy.
+
+By timestamp age, a group is expired only once it **provably cannot overlap the Max Age window**: every frame it could still present is older than the budget allows.
 Being behind is not itself a reason to expire anything.
 [Prioritization](#prioritization) already transmits newer groups first, so an older group consumes only whatever capacity is left over; it therefore closes the gap faster than the live edge advances, and a receiver that is behind can converge without losing content.
 What cannot be recovered is a group with nothing left worth delivering, and that is what expiration removes.
 
-A group's **reach** is the first frame timestamp of the next group by sequence number, or unbounded when no later group has presented a frame.
+A group's **reach** is the first frame timestamp of its successor, or unbounded when the successor has not presented a frame.
 A group cannot present past where its successor begins, so this is the furthest it could still reach.
 Its own frames do not bound it: frame durations are not carried on the wire, so a group's last frame timestamp is where that frame *starts* presenting, not where the group ends.
-A group whose successor has not presented a frame is therefore never expired, because nothing yet proves where it stops.
+A group whose successor has not presented a frame therefore has no timestamp age yet, because nothing proves where it stops.
 The group itself needs no timestamp: a zero-frame group (a keep-alive or gap marker) is bounded by its successor's first frame the same way.
 
 Reach is an exclusive bound, so a timestamp age **equal** to Max Age already expires the group: the freshest frame it could still hold sits strictly below its reach, and is therefore strictly older than the budget.
-A Max Age of zero follows from the same rule without a special case.
+An arrival age equal to Max Age expires it too, so a Max Age of zero expires a group as soon as its successor is available, without a special case.
 
-Measuring in timestamps rather than arrival means a burst of groups delivered together still reads as its true age, so catching up never resets the clock.
 
 An expired group SHOULD be reset at the QUIC level to avoid consuming flow control.
 
@@ -1560,6 +1566,7 @@ The `Message Length` describes the payload size on the wire.
 - A GOAWAY recipient MAY keep opening requests on the current session until it has moved to a replacement session; previously it MUST NOT open new streams. The sender SHOULD keep answering them and MAY reset one with GOING_AWAY, which the recipient SHOULD retry on another route.
 - Replaced Warm and Cold Route Cost with one static Route Cost in moq-lite-07-wip; lite-06 retains both fields, reading Warm and writing Cold at saturation.
 - Made TRACK_INFO Publisher Max Age optional, encoded as milliseconds plus one with zero meaning no limit.
+- Expiration judges a group by its successor on two ages, expiring it once either meets Max Age: the arrival age since the successor became available at the endpoint, and the timestamp age. An untimed Track has only the arrival age.
 - Added `Largest Group` and `Largest Frame` to SUBSCRIBE_OK: the publisher's largest position when it answers, which a subscriber takes as where the live feed is. A publisher MUST answer at once when the requested start is past it. Earlier versions carry no such position, so a subscriber takes the first frame instead.
 - Added `Epoch` to ANNOUNCE_START, SUBSCRIBE, TRACK, and FETCH: a UUIDv7 naming the publisher instance, or empty. A path and an Epoch name one Broadcast. A relay MAY move a subscription between routes with the same Epoch, continuing from the first frame the subscriber lacks instead of at a group boundary, and never between routes with different Epochs or none. The newest Epoch wins a path for new requests, while subscriptions to the older one stay until their route goes. Replaces the first-hop identity.
 - Added ANNOUNCE_RESTART (0x3): another publisher instance replaces a live advertisement, under a new Epoch or, without one, through another route, including a path beneath a prefix moving to another route. Older versions send ANNOUNCE_END then ANNOUNCE_START for it.

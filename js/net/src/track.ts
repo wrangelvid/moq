@@ -21,8 +21,8 @@ import { type Broadcast as BroadcastWire, registerTrackConsumer } from "./wire.t
 
 export type { Datagram } from "./datagram.ts";
 
-// Wall-clock bound for idle cached content, matching Rust cache::DEFAULT_EXPIRY.
-// Media maxDelay only bounds how far behind the live edge a reader may fall.
+// Wall-clock bound for idle cached content, matching Rust cache::DEFAULT_EXPIRY. Separate
+// from maxDelay and maxAge, which judge a group from when its successor arrived.
 const CACHE_WINDOW_MS = 30_000;
 
 // The cache scans at most this many times per idle cache window.
@@ -76,11 +76,12 @@ export interface Info {
 	 */
 	timescale?: Timescale | null;
 	/**
-	 * Publisher Max Age: how far behind the live edge a group may fall in media
-	 * timestamps, in milliseconds, before it is stale. Reported in TRACK_INFO (Lite05+)
-	 * so relays re-serve with the same bound. Omission sets no publisher limit; zero
-	 * serves only the live edge. A congestion stall cannot age content out; idle cache
-	 * eviction has a separate wall-clock window. This clamps each subscriber budget.
+	 * Publisher Max Age, in milliseconds: a non-latest group is stale once its successor
+	 * arrived that long ago at this hop, or the live edge's media time is that far past its
+	 * reach (where its successor begins). The newest group never is. It clamps each
+	 * subscriber budget, and is reported in TRACK_INFO (Lite05+) so relays re-serve with the
+	 * same bound. Omission sets no publisher limit; zero serves only the live edge. The idle
+	 * cache window is a separate wall-clock bound.
 	 * Rounded up to a whole millisecond by {@link infoDefaults}, which refuses a negative
 	 * or non-finite value and a result past `Number.MAX_SAFE_INTEGER`.
 	 */
@@ -142,8 +143,9 @@ export interface Subscription {
 	/** Delivery priority relative to this session's other subscriptions (`0..=255`). Defaults to `0`. */
 	priority?: number;
 	/**
-	 * How far (milliseconds) a non-latest group may fall behind the live edge before it is
-	 * skipped. Defaults to `0`.
+	 * How far (milliseconds) a non-latest group may fall behind before it is skipped: once its
+	 * successor arrived that long ago, or the live edge's media time is that far past where
+	 * its successor begins. Defaults to `0`, which keeps only the newest group.
 	 * Rounded up to a whole millisecond, so a value derived from a measurement is never
 	 * shortened. A negative or non-finite value, or one past `Number.MAX_SAFE_INTEGER`
 	 * after rounding, is refused.
@@ -153,10 +155,8 @@ export interface Subscription {
 	 * The lowest group the publisher may deliver (a floor), or omit for none.
 	 *
 	 * A floor, not a request: only {@link maxDelay} asks for data, and the floor bounds how
-	 * far back it may reach. Omitting it and a floor of 0 differ only on an untimed track,
-	 * where nothing is ever stale: omitted starts at the latest group, and an explicit floor
-	 * replays from there. A floor above the live edge simply waits there (a resumed
-	 * subscription naming where it left off).
+	 * far back it may reach, on a timed or an untimed track alike. A floor above the live
+	 * edge simply waits there (a resumed subscription naming where it left off).
 	 */
 	groups?: Groups;
 	/**
@@ -345,8 +345,7 @@ export class Consumer {
 	 * The cursor starts at the group the subscription named (its floor), or 0.
 	 * {@link Subscription.maxDelay} is what asks for data: delivery skips everything above
 	 * the floor that the budget convicts, so the default budget of zero delivers only the
-	 * latest group and a larger one reaches back over what it can still use. An untimed
-	 * track has nothing to convict, so without a floor it starts at its latest group.
+	 * latest group and a larger one reaches back over what it can still use.
 	 */
 	subscribe(options?: Subscription): Subscriber {
 		return this.#broadcast.subscribe(this.name, options);
@@ -388,6 +387,15 @@ function timelineInsert(timeline: GroupConsumer[], group: GroupConsumer): void {
 	else timeline.splice(index, 0, group);
 }
 
+// One judgment's view of a subscription: its clamped budget, the wall clock, and the live
+// edge under the cursor's `end` cap, resolved once per pass over a backlog.
+type Drift = {
+	budget: number;
+	now: number;
+	presentation?: { sequence: number; timestamp: Timestamp };
+	end?: number;
+};
+
 // The shared state behind a Producer / Subscriber pair. Package-internal
 // wiring, unexported so it never appears in the published type declarations.
 class TrackState {
@@ -418,9 +426,11 @@ class TrackState {
 	update: Signal<Subscription | undefined>;
 	/** Resolved once the producer commits the immutable properties. */
 	info = new Signal<Info | undefined>(undefined);
-	// Set by an unfloored subscriber made before accept(), which calls it to settle its
-	// start the moment the track's timedness is known.
-	settle?: () => void;
+	// Bumped when the earliest wall deadline a held group's guard waits on comes due, since
+	// no write may follow to wake it.
+	aged = new Signal(0);
+	agedTimer?: ReturnType<typeof setTimeout>;
+	agedAt = 0;
 
 	constructor(subscription?: Subscription) {
 		this.update = new Signal(subscription === undefined ? undefined : subscriptionDefaults(subscription));
@@ -455,8 +465,8 @@ async function resolveInfo(state: TrackState): Promise<Info> {
 }
 
 // A source group retained in the producer cache, with the mirror handed to each sink
-// so eviction can drop them together.
-type CachedGroup = { group: GroupProducer; mirrors: Map<TrackState, GroupConsumer> };
+// so eviction can drop them together, and when it arrived at this hop.
+type CachedGroup = { group: GroupProducer; mirrors: Map<TrackState, GroupConsumer>; arrival: number };
 
 let bindProducerSequence: (producer: Producer, sequence: TrackSequence) => void;
 
@@ -655,10 +665,7 @@ export class Producer {
 		}
 		this.#state.info.set(resolved);
 		// Propagate to any sink handed out before accept (the on-demand path).
-		for (const sink of this.#sinks) {
-			sink.info.set(resolved);
-			sink.settle?.();
-		}
+		for (const sink of this.#sinks) sink.info.set(resolved);
 		this.#updateSubscription();
 		return this;
 	}
@@ -669,8 +676,7 @@ export class Producer {
 	 * Its cursor starts at the group the subscription named (its floor), or 0.
 	 * {@link Subscription.maxDelay} is what asks for data: delivery skips everything above
 	 * the floor that the budget convicts, so the default budget of zero delivers only the
-	 * latest group and a larger one reaches back over what it can still use. An untimed
-	 * track has nothing to convict, so without a floor it starts at its latest group.
+	 * latest group and a larger one reaches back over what it can still use.
 	 */
 	subscribe(options: Subscription = {}): Subscriber {
 		const sink = new TrackState(options);
@@ -757,6 +763,7 @@ export class Producer {
 	// reference. Tracked on the entry so eviction can drop it from the sink.
 	#mirror(entry: CachedGroup, sink: TrackState): void {
 		const dst = entry.group.mirror();
+		hooks.arriveGroup(dst, entry.arrival);
 		entry.mirrors.set(sink, dst);
 		timelineInsert(sink.timeline, dst);
 		void dst.readable().then(() => sink.timelineChanged.update((revision) => revision + 1));
@@ -879,7 +886,7 @@ export class Producer {
 
 	// Retain a source group and fan it out to every live sink.
 	#publish(group: GroupProducer): void {
-		const entry: CachedGroup = { group, mirrors: new Map<TrackState, GroupConsumer>() };
+		const entry: CachedGroup = { group, mirrors: new Map<TrackState, GroupConsumer>(), arrival: performance.now() };
 		this.#cache.push(entry);
 		this.#cached.set(group.sequence, entry);
 		this.#advance(group.sequence);
@@ -1168,11 +1175,7 @@ export class Subscriber {
 	// sequence cursor so frame reads and {@link Ordered.nextGroup} share one floor.
 	#frameGroup?: GroupConsumer;
 
-	#drift(): {
-		budget: number;
-		presentation?: { sequence: number; timestamp: Timestamp };
-		end?: number;
-	} {
+	#drift(): Drift {
 		const { end } = this.#cursor.peek();
 		const timeline = this.#state.timeline;
 		let presentation: { sequence: number; timestamp: Timestamp } | undefined;
@@ -1195,57 +1198,46 @@ export class Subscriber {
 					? requested
 					: Math.min(requested, retained)
 				: Number.POSITIVE_INFINITY,
+			now: performance.now(),
 			presentation,
 			end,
 		};
 	}
 
-	// The furthest presentation time the group at `sequence` could still reach: where its
-	// immediate servable successor begins, or undefined when nothing proves where it
-	// stops. An upper bound, deliberately: a frame's duration is not on the wire, so a
-	// group's own last timestamp says where it starts presenting, not where it ends.
-	// Only the *immediate* successor counts: timestamps need not rise with sequence (a
-	// rewind reorders them), so a later stamped group proves nothing about where an
-	// unstamped successor will begin, and shrinking the bound is the unsafe direction.
-	// An unstamped successor leaves the reach unbounded until it presents a frame.
-	#reach(sequence: number, end?: number): number | undefined {
+	// The group a candidate at `sequence` is measured against: the first servable group above
+	// it below the `end` cap. Re-read on every judgment, so a lower group landing later or an
+	// abort hands the role to the right group.
+	#successor(sequence: number, end?: number): GroupConsumer | undefined {
 		const timeline = this.#state.timeline;
 		for (let i = timelineIndex(timeline, sequence + 1); i < timeline.length; i++) {
 			const successor = timeline[i];
 			if (end !== undefined && successor.sequence >= end) break;
 			if (successor.closed.peek() instanceof Error) continue;
-			return hooks.groupTimestamp(successor)?.asMillis();
+			return successor;
 		}
 		return undefined;
 	}
 
-	// Whether the drift budget says to give up on `group`.
+	// Whether the drift budget says to give up on `group`: once its successor arrived at this
+	// hop `budget` ago, or the live edge's media time is `budget` past its reach. Mirrors the
+	// Rust `TrackState::drifted`.
 	//
-	// Presentation time measures a group by how far it could still reach, not by how far
-	// behind it started. Being behind is survivable: priority transmits newer groups first,
-	// so a backlog bursts at whatever rate is left over and closes the gap faster than the
-	// live edge advances. A group is abandoned only once everything it could still present
-	// falls outside the budget.
+	// The wall clock bounds a peer whose timestamps stall or lie; media time convicts a burst
+	// that arrived all at once. The newest group has no successor, so it never ages.
 	//
-	// A group's reach is bounded by its nearest successor: it cannot present past where the
-	// next group begins. Its own frames say nothing, since a frame's duration is not on the
-	// wire, and the candidate needs no timestamp of its own: an empty group is bounded by
-	// its stamped successor the same way. The bound is exclusive, so the comparison is `>=`:
-	// the freshest frame a group could still hold sits just below its reach, so an age equal
-	// to the budget already puts every frame in it strictly past the budget. A zero budget
-	// falls out for free. Only timestamps drive expiry; wall-clock reclamation of idle
-	// content is the cache's own policy, not the budget's.
-	#isStale(
-		group: GroupConsumer,
-		drift: {
-			budget: number;
-			presentation?: { sequence: number; timestamp: Timestamp };
-			end?: number;
-		},
-	): boolean {
+	// Reach is where the immediate successor begins: a frame's duration is not on the wire,
+	// so a group's own frames say where it starts presenting, not where it ends. Timestamps
+	// need not rise with sequence, so only the immediate successor bounds it, and an
+	// unstamped one leaves the media term open. The bound is exclusive, so an age equal to
+	// the budget already convicts, and a zero budget convicts as soon as a successor exists.
+	#isStale(group: GroupConsumer, drift: Drift): boolean {
 		if (this.#state.timeline[timelineIndex(this.#state.timeline, group.sequence)] !== group) return false;
 
-		const reach = this.#reach(group.sequence, drift.end);
+		const successor = this.#successor(group.sequence, drift.end);
+		if (!successor) return false;
+		if (drift.now - (hooks.groupArrival(successor) ?? drift.now) >= drift.budget) return true;
+
+		const reach = hooks.groupTimestamp(successor)?.asMillis();
 		return (
 			drift.presentation !== undefined &&
 			drift.presentation.sequence > group.sequence &&
@@ -1254,10 +1246,40 @@ export class Subscriber {
 		);
 	}
 
+	// Wake the held groups' guards when `group`'s wall deadline comes due, since a stalled
+	// track may write nothing more. One timer per subscriber, kept at the earliest deadline.
+	#age(group: GroupConsumer, drift: Drift): void {
+		const successor = this.#successor(group.sequence, drift.end);
+		const arrival = successor && hooks.groupArrival(successor);
+		if (arrival === undefined) return;
+		const at = arrival + drift.budget;
+		const state = this.#state;
+		if (!Number.isFinite(at) || state.closed.peek() !== undefined) return;
+		if (state.agedTimer !== undefined && state.agedAt <= at) return;
+
+		clearTimeout(state.agedTimer);
+		const timer = setTimeout(
+			() => {
+				state.agedTimer = undefined;
+				state.aged.update((revision) => revision + 1);
+			},
+			Math.max(0, Math.ceil(at - drift.now)),
+		);
+		// A latency deadline is never a reason to hold a Node/Bun process open.
+		(timer as unknown as { unref?: () => void }).unref?.();
+		state.agedTimer = timer;
+		state.agedAt = at;
+	}
+
 	#guard(group: GroupConsumer): GroupConsumer {
 		if (!this.#enforceLatency) return group;
 		hooks.expireGroup(group, {
-			expired: () => this.#isStale(group, this.#drift()),
+			expired: () => {
+				const drift = this.#drift();
+				if (this.#isStale(group, drift)) return true;
+				this.#age(group, drift);
+				return false;
+			},
 			changed: [
 				this.#state.groups,
 				this.#state.timelineChanged,
@@ -1265,6 +1287,7 @@ export class Subscriber {
 				this.#state.info,
 				this.#cursor,
 				this.#state.closed,
+				this.#state.aged,
 			],
 		});
 		return group;
@@ -1276,35 +1299,7 @@ export class Subscriber {
 		// The cursor's floor is the group the subscription named, or 0. A floor is the
 		// only thing a start contributes; {@link Subscription.maxDelay} is what asks for
 		// data, and delivery skips everything above the floor that the budget convicts.
-		// Nothing on an untimed track is ever stale, so there the budget would replay the
-		// whole cache: an unfloored subscriber starts at the latest group instead.
-		const groups = state.update.peek()?.groups ?? {};
-		const bounds = groupBounds(groups);
-		const start = groups.start === undefined ? this.#untimedStart(bounds.end) : undefined;
-		this.#cursor.set({ start: start ?? bounds.start });
-		// Timedness is unknown until accept(), so an unfloored subscriber made before it
-		// settles its start then, against the groups that existed at that moment.
-		if (groups.start === undefined && !state.info.peek()) state.settle = () => this.#settleStart();
-	}
-
-	// Raise the floor of an unfloored subscriber made before accept(), once the track is
-	// known to be untimed.
-	#settleStart(): void {
-		this.#state.settle = undefined;
-		const start = this.#untimedStart(this.#cursor.peek().end);
-		if (start === undefined) return;
-		this.#cursor.update((cursor) => ({ ...cursor, start: Math.max(cursor.start, start) }));
-	}
-
-	// The newest servable group below the `end` cap, when the track is known to be untimed.
-	#untimedStart(end: number | undefined): number | undefined {
-		const info = this.#state.info.peek();
-		if (!info || info.timescale != null) return undefined;
-		const timeline = this.#state.timeline;
-		for (let i = (end === undefined ? timeline.length : timelineIndex(timeline, end)) - 1; i >= 0; i--) {
-			if (!(timeline[i].closed.peek() instanceof Error)) return timeline[i].sequence;
-		}
-		return undefined;
+		this.#cursor.set({ start: groupBounds(state.update.peek()?.groups ?? {}).start });
 	}
 
 	static {
@@ -1444,7 +1439,6 @@ export class Subscriber {
 	 */
 	setGroups(groups: Groups): void {
 		const { start, end } = groupBounds(groups);
-		if (groups.start !== undefined) this.#state.settle = undefined;
 		this.#cursor.update((cursor) => ({ start: Math.max(cursor.start, start), end }));
 	}
 
@@ -1452,7 +1446,6 @@ export class Subscriber {
 	// Rust `start_at`. Local readers stay monotonic; only the wire publisher lowers.
 	#replaceGroups(groups: Groups): void {
 		const { start, end } = groupBounds(groups);
-		if (groups.start !== undefined) this.#state.settle = undefined;
 		this.#cursor.update((cursor) => ({
 			start: groups.start === undefined ? cursor.start : start,
 			end,
@@ -1466,6 +1459,8 @@ export class Subscriber {
 		// producer close, so the subscriber leaving is what must release them: closing
 		// and clearing wakes a pending read to observe the end instead of hanging.
 		closeTrackState(this.#state, abort);
+		clearTimeout(this.#state.agedTimer);
+		this.#state.agedTimer = undefined;
 		this.#state.groups.mutate((groups) => {
 			for (const group of groups) group.close(abort);
 			groups.length = 0;
@@ -1486,10 +1481,10 @@ export class Subscriber {
 	 * Honors the range set by {@link setGroups}: a group
 	 * beyond the cap stays buffered (not dropped) and is offered once the cap rises, even
 	 * after a clean close, without blocking in-range groups that arrive behind it.
-	 * A group whose presentation time is further behind the live edge than this
-	 * subscriber's `maxDelay` is skipped. The default of zero takes the live edge.
-	 * The budget remains attached after return, so a pending frame read rejects if a stalled
-	 * group becomes stale while newer data advances.
+	 * A group this subscriber's `maxDelay` convicts is skipped (see
+	 * {@link Subscription.maxDelay}). The default of zero takes the live edge.
+	 * The budget remains attached after return, so a pending frame read gives up on a stalled
+	 * group once it becomes stale, even if nothing more is written.
 	 *
 	 * The first call commits this track to arrival order: {@link ordered} throws afterwards.
 	 */
@@ -1684,7 +1679,7 @@ export class Subscriber {
 	 *
 	 * Groups are acquired through the same sequence cursor as {@link Ordered.nextGroup},
 	 * so frames never run backwards: a late lower-sequence group is skipped, and so is
-	 * one every frame of which `maxDelay` proves is too old. A group the budget abandons
+	 * one `maxDelay` convicts. A group the budget abandons
 	 * mid-stall ends cleanly and the cursor resyncs from the next group; a gap inside a
 	 * group still surfaces as {@link TooFarBehind} or {@link GroupTooLarge}.
 	 */
@@ -1784,12 +1779,11 @@ export class Subscriber {
  * skipped rather than delivered out of turn.
  *
  * `maxDelay` applies as this cursor reads, exactly as it does on the arrival cursor: a
- * group is skipped once its reach, where its immediate successor begins, is that far
- * behind the newest frame on the track. Nothing weaker convicts it, since the reach is
- * the only proof that every frame it could still hold is past the budget, so a backlog
+ * group is skipped once its immediate successor arrived that long ago, or its reach, where
+ * that successor begins, is that far behind the newest frame on the track. A backlog
  * inside the budget is still delivered whole, as a burst in order. The budget follows a
- * group already handed out too: a stalled group's pending frame read rejects once newer
- * content has pulled that far ahead.
+ * group already handed out too: a stalled group's pending frame read gives up once it is
+ * stale.
  */
 export class Ordered {
 	/** The track name. */
@@ -1861,9 +1855,8 @@ export class Ordered {
 	 * Return the next group with a strictly-greater sequence number than the last returned.
 	 *
 	 * Late arrivals (sequence at or below the last returned) are silently skipped, as is a
-	 * group whose every frame is further behind the live edge than `maxDelay` (the default of
-	 * zero keeps only what nothing newer has superseded). Honors the bounds set by
-	 * {@link setGroups}.
+	 * group `maxDelay` convicts (the default of zero keeps only what nothing newer has
+	 * superseded). Honors the bounds set by {@link setGroups}.
 	 */
 	nextGroup(): Promise<GroupConsumer | undefined> {
 		return ordered_.nextGroup(this.#subscriber);

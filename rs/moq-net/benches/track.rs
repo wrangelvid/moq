@@ -23,6 +23,13 @@
 //! each append must wake only the reads it can expire, so waking the backlog shows up
 //! as a slope over it.
 //!
+//! `track_retention_*` sweep a pool of stalled tracks over tracks and cached groups per
+//! track, each group stamped at one instant so only the wall clock ages it. `write` is
+//! one append to a live track there plus the pass that dates it, `pass` the driver's
+//! pass between sweeps, and `sweep` a due pass that judges every group by its track's
+//! `max_age`: `fresh` keeps them all, `stale` reclaims all but each track's newest. The
+//! bytes the stalled tracks still hold after a stale sweep print once.
+//!
 //! Run with `cargo bench -p moq-net --bench track`.
 
 use std::hint::black_box;
@@ -68,6 +75,19 @@ const WRITERS: [usize; 4] = [1, 2, 4, 8];
 
 /// Tracks sharing one expiring pool: the table a due collection pass walks.
 const SWEPT: [usize; 4] = [1, 64, 1_024, 16_384];
+
+/// Stalled tracks sharing a pool with retention, and cached groups per track.
+const STALLED_TRACKS: [usize; 3] = [1, 100, 10_000];
+const STALLED_GROUPS: [usize; 4] = [1, 10, 100, 1_000];
+
+/// The largest stalled table built, in groups, so the sweep stays within a laptop's memory.
+const MAX_STALLED: usize = 100_000;
+
+/// The retention a live or stale track declares, past by the first due sweep.
+const MAX_AGE: Duration = Duration::from_secs(1);
+
+/// The retention a fresh track declares, never past in a run.
+const FRESH_AGE: Duration = Duration::from_secs(3600);
 
 /// Keeps the ownership chain alive around the track and its subscribers.
 struct Fanout {
@@ -198,6 +218,54 @@ impl Swept {
 	}
 }
 
+/// Stalled tracks of cached groups stamped at one instant, sharing an expiring pool whose
+/// clock has dated them, so only the wall clock can age them out.
+struct Stalled {
+	broadcast: broadcast::Producer,
+	_tracks: Vec<track::Producer>,
+	pool: cache::Pool,
+	now: Instant,
+}
+
+impl Stalled {
+	fn new(tracks: usize, groups: usize, max_age: Duration) -> Self {
+		let mut info = broadcast::Info::default();
+		info.pool = cache::Pool::new(cache::Config::default().with_expiry(cache::DEFAULT_EXPIRY));
+		let pool = info.pool.clone();
+		let broadcast = broadcast::Producer::new(info);
+		let now = Instant::now();
+		pool.gc(now);
+		let payload = Bytes::from_static(&[0; PAYLOAD]);
+		let tracks = (0..tracks)
+			.map(|i| {
+				let info = timed().with_max_age(max_age);
+				let track = broadcast.create_track(format!("stalled{i}"), info).unwrap();
+				for _ in 0..groups {
+					let mut group = track.append_group().unwrap();
+					group.write_frame(Timestamp::ZERO, payload.clone()).unwrap();
+					group.finish().unwrap();
+				}
+				track
+			})
+			.collect();
+		pool.gc(now);
+		Self {
+			broadcast,
+			_tracks: tracks,
+			pool,
+			now,
+		}
+	}
+
+	/// The sweeps that fit the table bound.
+	fn sizes() -> impl Iterator<Item = (usize, usize)> {
+		STALLED_TRACKS
+			.into_iter()
+			.flat_map(|tracks| STALLED_GROUPS.into_iter().map(move |groups| (tracks, groups)))
+			.filter(|(tracks, groups)| tracks * groups <= MAX_STALLED)
+	}
+}
+
 /// Steady viewers on one track, with the producer's aggregate poll caught up.
 struct Churn {
 	_broadcast: broadcast::Producer,
@@ -260,6 +328,72 @@ fn bench_gc(c: &mut Criterion) {
 	group.finish();
 }
 
+fn bench_retention(c: &mut Criterion) {
+	let mut write = c.benchmark_group("track_retention_write");
+	for (tracks, groups) in Stalled::sizes() {
+		write.throughput(Throughput::Elements(1));
+		write.bench_function(BenchmarkId::from_parameter(format!("{tracks}x{groups}")), |b| {
+			let stalled = Stalled::new(tracks, groups, MAX_AGE);
+			// A live track whose media time keeps `groups` within its retention.
+			let step = (MAX_AGE.as_micros() as u64 / groups as u64).max(1);
+			let live = stalled
+				.broadcast
+				.create_track("live", timed().with_max_age(MAX_AGE))
+				.unwrap();
+			let payload = Bytes::from_static(&[0; PAYLOAD]);
+			let mut micros = 0;
+			b.iter(|| {
+				let mut group = live.append_group().unwrap();
+				group
+					.write_frame(Timestamp::from_micros(micros).unwrap(), payload.clone())
+					.unwrap();
+				group.finish().unwrap();
+				micros += step;
+				black_box(stalled.pool.gc(stalled.now))
+			});
+		});
+	}
+	write.finish();
+
+	let mut pass = c.benchmark_group("track_retention_pass");
+	for (tracks, groups) in Stalled::sizes() {
+		pass.throughput(Throughput::Elements(1));
+		pass.bench_function(BenchmarkId::from_parameter(format!("{tracks}x{groups}")), |b| {
+			let stalled = Stalled::new(tracks, groups, MAX_AGE);
+			b.iter(|| black_box(stalled.pool.gc(stalled.now)));
+		});
+	}
+	pass.finish();
+
+	let mut sweep = c.benchmark_group("track_retention_sweep");
+	sweep.sample_size(10);
+	let due = |stalled: &Stalled| stalled.now + cache::DEFAULT_EXPIRY / 2;
+	for (tracks, groups) in Stalled::sizes() {
+		sweep.throughput(Throughput::Elements((tracks * groups) as u64));
+		let stalled = Stalled::new(tracks, groups, MAX_AGE);
+		let before = stalled.pool.used();
+		stalled.pool.gc(due(&stalled));
+		eprintln!(
+			"track_retention_sweep/stale/{tracks}x{groups}: {before} bytes cached, {} after a due sweep",
+			stalled.pool.used()
+		);
+		drop(stalled);
+		for (name, max_age) in [("fresh", FRESH_AGE), ("stale", MAX_AGE)] {
+			sweep.bench_function(BenchmarkId::new(name, format!("{tracks}x{groups}")), |b| {
+				b.iter_batched(
+					|| Stalled::new(tracks, groups, max_age),
+					|stalled| {
+						black_box(stalled.pool.gc(due(&stalled)));
+						stalled
+					},
+					BatchSize::PerIteration,
+				);
+			});
+		}
+	}
+	sweep.finish();
+}
+
 fn bench_fanout(c: &mut Criterion) {
 	let mut group = c.benchmark_group("track_fanout_group");
 	for subscribers in FANOUT {
@@ -277,9 +411,23 @@ fn bench_fanout(c: &mut Criterion) {
 }
 
 /// Write `iterations` single-frame groups across independent tracks sharing one pool.
-fn parallel_write(pool: &cache::Pool, writers: usize, iterations: u64) -> Duration {
+///
+/// With `driven`, a driver thread passes the pool's clock while they write, as an origin's
+/// driver does for every group that lands.
+fn parallel_write(pool: &cache::Pool, writers: usize, iterations: u64, driven: bool) -> Duration {
 	let barrier = Arc::new(Barrier::new(writers + 1));
+	let done = std::sync::atomic::AtomicBool::new(false);
+	if driven {
+		pool.gc(Instant::now());
+	}
 	std::thread::scope(|scope| {
+		if driven {
+			scope.spawn(|| {
+				while !done.load(std::sync::atomic::Ordering::Relaxed) {
+					black_box(pool.gc(Instant::now()));
+				}
+			});
+		}
 		let handles: Vec<_> = (0..writers)
 			.map(|writer| {
 				let pool = pool.clone();
@@ -311,7 +459,9 @@ fn parallel_write(pool: &cache::Pool, writers: usize, iterations: u64) -> Durati
 		for handle in handles {
 			handle.join().unwrap();
 		}
-		start.elapsed()
+		let elapsed = start.elapsed();
+		done.store(true, std::sync::atomic::Ordering::Relaxed);
+		elapsed
 	})
 }
 
@@ -319,13 +469,17 @@ fn bench_parallel_write(c: &mut Criterion) {
 	let config = cache::Config::default()
 		.with_capacity(CACHE_CAPACITY)
 		.with_expiry(cache::DEFAULT_EXPIRY);
-	let pool = cache::Pool::new(config);
+	let pool = cache::Pool::new(config.clone());
+	let driven = cache::Pool::new(config);
 	let mut group = c.benchmark_group("track_parallel_write");
 	// No throughput: one iteration is one frame write, wherever it landed, so the
 	// per-iteration time is already the number to compare across writer counts.
 	for writers in WRITERS {
 		group.bench_with_input(BenchmarkId::from_parameter(writers), &writers, |b, &writers| {
-			b.iter_custom(|iterations| parallel_write(&pool, writers, iterations));
+			b.iter_custom(|iterations| parallel_write(&pool, writers, iterations, false));
+		});
+		group.bench_with_input(BenchmarkId::new("driven", writers), &writers, |b, &writers| {
+			b.iter_custom(|iterations| parallel_write(&driven, writers, iterations, true));
 		});
 	}
 	group.finish();
@@ -531,6 +685,7 @@ criterion_group!(
 	bench_subscriber_churn_after_peak,
 	bench_subscriber_join,
 	bench_datagram_subscriber_join,
-	bench_parked_read
+	bench_parked_read,
+	bench_retention
 );
 criterion_main!(benches);

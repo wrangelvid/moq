@@ -48,8 +48,8 @@ pub struct Config {
 	///
 	/// Sets both halves of the retention bound. The pool's wall-clock LRU window
 	/// becomes this: a group nobody has read or written for this long is
-	/// reclaimed, so actively-read history stays cached. Each track's own media-timestamp
-	/// retention window is also clamped down to this, so a publisher advertising
+	/// reclaimed, so actively-read history stays cached. Each track's own retention
+	/// window is also clamped down to this, so a publisher advertising
 	/// a longer window can't promise more history than the relay keeps. This
 	/// bounds memory by age where `capacity` bounds it by bytes. When unset, the
 	/// LRU window keeps its 30 second default and each track keeps its own

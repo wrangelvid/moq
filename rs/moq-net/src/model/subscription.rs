@@ -43,24 +43,28 @@ pub struct Subscription {
 	///
 	/// # How delay is measured
 	///
-	/// In presentation time only. A group is measured by its *reach*, where its immediate
-	/// successor begins, against the newest frame of the latest group: it cannot present
-	/// past its successor, so once everything it could still hold falls outside the budget
-	/// it is provably useless. The candidate needs no timestamp of its own, so an empty or
-	/// stalled group is bounded by its stamped successor the same way. Wall-clock
-	/// reclamation of idle content is the cache's own policy, not this budget's.
+	/// From a group's immediate successor, on two clocks, and the group is stale once either
+	/// reaches the budget. The newest group has no successor, so it never is.
 	///
-	/// An untimed track (pre-Lite05 moq-lite, or moq-transport without TIMESCALE) has no
-	/// media time, so none of its groups is ever stale, and a new subscriber with no
-	/// [`Self::start`] begins at its latest group instead of replaying the cache.
+	/// - Wall clock: how long ago the successor arrived at this hop. This bounds a peer whose
+	///   timestamps stall, and is the only measure of an untimed track (pre-Lite05 moq-lite,
+	///   or moq-transport without TIMESCALE). A reader blocked on a superseded group is
+	///   released once it fires, with nothing else written.
+	/// - Presentation time: the group's *reach*, where its successor begins, against the
+	///   newest frame of the latest group. It cannot present past its successor, so once
+	///   everything it could still hold falls outside the budget it is provably useless.
+	///   This convicts a burst of old groups that arrive at once.
+	///
+	/// Starting the wall clock at the successor's arrival means a congestion stall that holds
+	/// the successor back ages nothing. The wall clock is the cache pool's, advanced by its
+	/// [`gc`](crate::cache::Pool::gc), which an origin's driver calls.
 	pub max_delay: Duration,
 	/// The lowest [`Position`] the publisher may deliver, or `None` for no floor.
 	///
 	/// A floor, not a request: only [`Self::max_delay`] asks for data, and the floor bounds
-	/// how far back it may reach. `None` and a floor of group 0 mean the same thing on a
-	/// timed track, since nothing sits below group 0. On an untimed track, which no budget
-	/// can measure, `None` starts at the latest group and a floor is honored as given.
-	/// Delivery starts at the oldest group at or above the floor that the budget still
+	/// how far back it may reach. `None` and a floor of group 0 mean the same thing, since
+	/// nothing sits below group 0. Delivery starts at the oldest group at or above the floor
+	/// that the budget still
 	/// considers fresh, so a floor above the live edge simply waits there (a resumed
 	/// subscription naming where it left off).
 	///

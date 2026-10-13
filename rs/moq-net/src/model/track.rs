@@ -99,19 +99,22 @@ pub struct Info {
 	/// (pre-Lite05 moq-lite, moq-transport drafts 14-16, or moq-transport without
 	/// TIMESCALE) is untimed.
 	pub timescale: Option<Timescale>,
-	/// How far behind the live edge a group may fall, in media timestamps, before it
-	/// is stale. The newest group is always retained.
+	/// How long a group other than the newest stays servable: it is stale once its
+	/// successor arrived at this hop that long ago, or once the live edge's timestamps
+	/// run that far past where it could still present. The newest group is always retained.
 	///
 	/// A retention bound rather than a delivery one, the inverse of an HTTP
 	/// `Cache-Control: max-age`. [`Subscription::max_delay`] is clamped to this, since a
-	/// group can't be waited for longer than it's kept around. Reported in TRACK_INFO so
+	/// group can't be waited for longer than it's kept around, and both are judged by the
+	/// one rule [`Subscription::max_delay`] describes. Stale groups no reader holds leave
+	/// the cache on the pool's sweep. Reported in TRACK_INFO so
 	/// relays re-serve with the same window. `None` (the default) sets no limit;
 	/// the origin cache ceiling and pool still apply. `Some(Duration::ZERO)` keeps the live edge.
 	///
-	/// Measured against timestamps rather than the wall clock, so a congestion stall
-	/// (timestamps stop advancing) can't age content out. Wall-clock reclamation of
-	/// content nobody is accessing belongs to the cache pool's own
-	/// [`expiry`](crate::cache::Pool::expiry) window, not to this budget.
+	/// The wall clock starts at the successor's arrival, so a congestion stall that holds
+	/// the successor back ages nothing. Reclaiming content nobody is accessing, newest group
+	/// included once the track ends, belongs to the cache pool's own
+	/// [`expiry`](crate::cache::Pool::expiry) window.
 	///
 	/// This is the `Publisher Max Age` on the wire, the publisher-side half of the
 	/// budget [`Subscription::max_delay`] sets for a subscriber.
@@ -379,6 +382,10 @@ struct Slot {
 	// group's place while it lasts; `group` stays the slot, still written by the feed,
 	// so an abandoned fetch leaves the group servable rather than gone. Boxed: rare.
 	head: Option<Box<group::Producer>>,
+
+	// When the group became servable here: where the wall clock starts aging the group
+	// before it.
+	arrival: super::expiry::Arrival,
 }
 
 impl Slot {
@@ -447,6 +454,20 @@ impl Slot {
 		for group in self.copies() {
 			group.cache_demote();
 		}
+	}
+
+	/// Whether a reader holds any copy, so dropping the slot would cut it short.
+	fn is_used(&self) -> bool {
+		self.copies().any(group::Producer::is_used)
+	}
+
+	/// Abort every copy no reader holds, returning whether none is left.
+	fn abort_unused(&self, err: Error) -> bool {
+		let mut gone = true;
+		for group in self.copies() {
+			gone &= group.abort_unused(err.clone());
+		}
+		gone
 	}
 
 	/// Abort every copy this slot holds.
@@ -684,10 +705,9 @@ impl TrackState {
 		}
 	}
 
-	/// The live edge a subscription bounded at `cap` measures drift against: the
-	/// highest-sequence group that has presented a frame, or `None` while nothing
-	/// stamped is servable (an unstamped track drives no expiry at all; the cache's
-	/// own wall-clock policy is what bounds it).
+	/// The live edge a subscription bounded at `cap` measures media drift against: the
+	/// highest-sequence group that has presented a stamped frame, or `None` while nothing
+	/// stamped is servable, which leaves the wall clock alone to judge.
 	///
 	/// One scan answers a whole poll. The highest-sequence edge in range is above
 	/// every candidate below it and above none at or past it. Recomputing per candidate
@@ -718,26 +738,6 @@ impl TrackState {
 			})
 	}
 
-	/// Where a new reader with no explicit start begins on an untimed track: its newest
-	/// servable group below the exclusive `cap`.
-	///
-	/// A drift budget resolves a timed track's start, but nothing is ever stale on an
-	/// untimed track, so the budget would replay the whole cache. `None` on a timed track,
-	/// or while nothing is servable yet.
-	fn untimed_start(&self, cap: Option<u64>) -> Option<u64> {
-		if self.info.as_ref()?.timescale.is_some() {
-			return None;
-		}
-		self.lookup
-			.range((
-				std::ops::Bound::Unbounded,
-				cap.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
-			))
-			.rev()
-			.find(|(_, slot)| slot.is_shown())
-			.map(|(sequence, _)| *sequence)
-	}
-
 	/// This track's own edge under the exclusive `cap`, for measuring drift.
 	fn drift_edge(&self, cap: Option<u64>) -> Edge {
 		Edge {
@@ -753,62 +753,93 @@ impl TrackState {
 			.is_some_and(|slot| slot.stamp == stamp && !slot.is_aborted())
 	}
 
-	/// The furthest presentation time the group at `sequence` could still reach: where
-	/// its immediate successor begins, or `None` when nothing proves where it stops.
+	/// The first servable slot in `from..cap`, stamped or not: for `from` one past a group,
+	/// that group's successor, which is where both of [`Self::is_stale`]'s clocks start.
 	///
-	/// An upper bound, deliberately. A frame's duration is not on the wire, so a group's
-	/// own last timestamp says where it *starts* presenting, not where it ends; only its
-	/// successor's start proves it cannot run past it. And only the *immediate* servable
-	/// successor counts: timestamps need not rise with sequence (a rewind reorders them),
-	/// so a later stamped group proves nothing about where an unstamped successor will
-	/// begin, and shrinking the bound is the unsafe direction. An unstamped successor
-	/// therefore leaves the reach unbounded until it presents its first frame, and so
-	/// does having no servable successor below `cap` at all.
-	fn reach(&self, sequence: u64, cap: Option<u64>) -> Option<Timestamp> {
-		self.first_servable(sequence.saturating_add(1), cap)?.timestamp()
-	}
-
-	/// The first servable group in `from..cap`, stamped or not.
-	fn first_servable(&self, from: u64, cap: Option<u64>) -> Option<&group::Producer> {
+	/// Only the *immediate* servable successor counts. Timestamps need not rise with
+	/// sequence (a rewind reorders them), so a later stamped group proves nothing about
+	/// where an unstamped successor will begin. Re-read on every judgement rather than
+	/// latched: a group landing below the current successor, or the successor aborting,
+	/// changes which group it is.
+	fn first_servable(&self, from: u64, cap: Option<u64>) -> Option<&Slot> {
 		self.lookup
 			.range(from..)
 			.map(|(_, slot)| slot)
 			.take_while(|slot| super::subscription::before_end(slot.group.sequence, cap))
 			.find(|slot| slot.is_shown())
-			.map(|slot| &slot.group)
 	}
 
-	/// Whether the group at `sequence` has drifted further behind `edge` than `budget`
-	/// tolerates, so a subscriber should skip it rather than hand it over.
+	/// Whether the group at `sequence` has fallen further behind than `budget` tolerates, so a
+	/// subscriber should skip it rather than hand it over, and retention may drop it.
+	///
+	/// A group is judged by its immediate servable successor (see [`Self::first_servable`]),
+	/// on two clocks, and is stale once either says so. The newest group has no successor,
+	/// so it never is.
+	///
+	/// - Wall clock: the successor arrived here a full `budget` ago. This bounds a peer whose
+	///   timestamps stall or lie, and judges an untimed group, which has no media time.
+	///   It starts at the successor's arrival rather than the group's own, so a congestion
+	///   stall that holds the successor back ages nothing.
+	/// - Media time: everything the group could still present falls outside the budget
+	///   behind the live edge. This convicts a startup burst that arrives all at once, which
+	///   the wall clock alone would keep.
 	///
 	/// Presentation time measures a group by how far it could still *reach*, not by how far
-	/// behind it started. Being behind is survivable: priority transmits newer groups
-	/// first, so a backlog bursts at whatever rate is left over and closes the gap faster
-	/// than the live edge advances. What is not survivable is having nothing left worth
-	/// delivering, so a group is abandoned only once everything it could still present
-	/// falls outside the budget.
-	///
-	/// A group's reach is bounded by its immediate successor (see [`Self::reach`]): it
-	/// cannot present past where the next group begins. The candidate itself needs no
-	/// timestamp: an empty group is bounded by its stamped successor the same way. Only
-	/// timestamps drive expiry, so nothing on an untimed track is ever stale; wall-clock
-	/// reclamation of idle content is the cache's own policy, not the budget's.
+	/// behind it started. Being behind is survivable: priority transmits newer groups first,
+	/// so a backlog bursts at whatever rate is left over and closes the gap faster than the
+	/// live edge advances. What is not survivable is having nothing left worth delivering.
+	/// The candidate itself needs no timestamp: an empty group is bounded by its stamped
+	/// successor the same way.
 	///
 	/// The bound is exclusive, so the comparison is `>=` rather than `>`: the freshest frame
 	/// a group could still hold sits just *below* its reach, so an age equal to the budget
 	/// already puts every frame in it strictly past the budget. That also makes a zero
-	/// budget fall out for free instead of needing a special case.
+	/// budget fall out for free: a group is stale once its successor is servable.
 	///
-	/// The edge must sit strictly above the candidate. The live edge is never late
+	/// The media edge must sit strictly above the candidate. The live edge is never late
 	/// against itself, and backfill or the tail of a rewound timeline can carry a high
 	/// timestamp on a low sequence without being an edge at all.
 	fn is_stale(&self, sequence: u64, edge: &Edge, budget: Duration) -> bool {
 		self.lookup.contains_key(&sequence) && self.drifted(sequence, edge, budget)
 	}
 
-	/// [`Self::is_stale`] for group `sequence`, whether this track holds it or not: its
-	/// successor here starts a full `budget` behind the edge.
+	/// [`Self::is_stale`] for group `sequence`, whether this track holds it or not.
 	fn drifted(&self, sequence: u64, edge: &Edge, budget: Duration) -> bool {
+		// The common case, a reader at the live edge, without a lookup.
+		if self.latest_group.is_none_or(|latest| latest <= sequence) {
+			return false;
+		}
+		let Some(successor) = self.first_servable(sequence.saturating_add(1), edge.cap) else {
+			return false;
+		};
+		self.aged(successor, budget) || self.behind(sequence, successor, edge, budget)
+	}
+
+	/// The wall-clock half of [`Self::is_stale`]: `successor` arrived a full `budget` ago.
+	fn aged(&self, successor: &Slot, budget: Duration) -> bool {
+		self.cache.pool().wall().aged(&successor.arrival, budget)
+	}
+
+	/// Date the groups that landed since the pool's last pass, a suffix of arrival order.
+	pub(super) fn date_arrivals(&self, at: u64) {
+		for (sequence, stamp) in self.arrival.iter().rev() {
+			let Some(slot) = self.lookup.get(sequence).filter(|slot| slot.stamp == *stamp) else {
+				continue;
+			};
+			if !slot.arrival.date(at) {
+				break;
+			}
+		}
+	}
+
+	/// The media-time half of [`Self::is_stale`]: `successor` starts a full `budget` behind
+	/// the edge.
+	///
+	/// The successor's first timestamp is the group's *reach*, the furthest it could still
+	/// present. An upper bound, deliberately: a frame's duration is not on the wire, so a
+	/// group's own last timestamp says where it *starts* presenting, not where it ends. An
+	/// unstamped successor leaves the reach unbounded until it presents its first frame.
+	fn behind(&self, sequence: u64, successor: &Slot, edge: &Edge, budget: Duration) -> bool {
 		// The edge was resolved under an earlier lock, so confirm it still names the
 		// same servable incarnation before it convicts a candidate. Failing safe
 		// (delivering) is right, since the next poll resolves a fresh edge.
@@ -818,13 +849,16 @@ impl TrackState {
 		else {
 			return false;
 		};
-		self.reach(sequence, edge.cap)
+		successor
+			.group
+			.timestamp()
 			.is_some_and(|reach| matches!(live.timestamp.checked_sub(reach), Ok(age) if Duration::from(age) >= budget))
 	}
 
 	/// [`Self::drifted`] under `cap`, parking `waiter` on exactly what else can move the
-	/// verdict: the successor's first frame or abort, the edge's abort, and the edge
-	/// crossing the deadline. Parking on every track change instead wakes each of N parked reads per append.
+	/// verdict: the successor's wall-clock deadline, its first frame or abort, the edge's
+	/// abort, and the edge crossing the media deadline. Parking on every track change
+	/// instead wakes each of N parked reads per append.
 	///
 	/// The caller parks on a group landing above `sequence` first, in the way that fits
 	/// whether this track holds it.
@@ -837,18 +871,27 @@ impl TrackState {
 			let successor = loop {
 				let successor = self.first_servable(sequence.saturating_add(1), cap);
 				match successor {
-					Some(group) if group.poll_closed(waiter).is_ready() && group.is_aborted() => continue,
+					Some(slot) if slot.group.poll_closed(waiter).is_ready() && slot.group.is_aborted() => continue,
 					successor => break successor,
 				}
 			};
-			// Unbounded until a group lands above, or the successor presents its first frame.
+			// Unbounded until a group lands above.
 			let Some(successor) = successor else {
 				return false;
 			};
-			if let Some(reach) = successor.timestamp() {
+			// Armed for whichever successor this pass resolved, stamped or not, so a
+			// re-selected one re-arms it. Registered before judging, like the media deadline.
+			if !budget.is_zero() {
+				self.cache.pool().wall().watch(&successor.arrival, budget, waiter);
+			}
+			if self.aged(successor, budget) {
+				return true;
+			}
+			if let Some(reach) = successor.group.timestamp() {
 				break reach;
 			}
-			if successor.poll_started(waiter).is_pending() || successor.timestamp().is_none() {
+			// Unbounded in media time until the successor presents its first frame.
+			if successor.group.poll_started(waiter).is_pending() || successor.group.timestamp().is_none() {
 				return false;
 			}
 		};
@@ -901,12 +944,14 @@ impl TrackState {
 		Poll::Pending
 	}
 
-	/// Expire groups idle past the pool's wall-clock LRU window, never the latest.
+	/// Expire groups idle past the pool's wall-clock LRU window, never the latest, and on
+	/// the pool's sweep, groups no reader holds that are stale under the track's retention.
 	///
-	/// The window is the pool's [`expiry`](cache::Pool::expiry), not the track's
-	/// [`max_age`](Info::max_age): retention is a media-timestamp promise, while this
-	/// is the cache's own guard against unread content pinning RAM, shared by every
-	/// track in the pool.
+	/// Two bounds. The pool's [`expiry`](cache::Pool::expiry) is the cache's own guard
+	/// against unread content pinning RAM, shared by every track in the pool. The track's
+	/// [`max_age`](Info::max_age) is the publisher's retention, judged by
+	/// [`Self::is_stale`] like every reader's budget, and spares a group a reader holds:
+	/// that reader's own budget decides when it gives up.
 	///
 	/// One bounded, rotating scan over the eviction order, which holds every cached
 	/// group except the protected latest. The cursor persists in the cache account, so
@@ -956,6 +1001,7 @@ impl TrackState {
 	/// that scanned further would report work the scan itself will not do.
 	pub(super) fn expiry_mutation_due(&self, scan: ExpiryScan) -> bool {
 		let len = self.evict.len();
+		let retention = self.retention(scan);
 		if len > 0 {
 			let start = scan.start % len;
 			let mut retained = 0;
@@ -968,6 +1014,9 @@ impl TrackState {
 					continue;
 				}
 				if slot.is_aborted() || (!self.protects(sequence) && slot.is_expired(&scan)) {
+					return true;
+				}
+				if self.outlived(sequence, &retention) && !slot.is_used() {
 					return true;
 				}
 				retained += 1;
@@ -1005,6 +1054,7 @@ impl TrackState {
 	/// [`Self::expiry_scan_drain`].
 	pub(super) fn evict_expired_scan(&mut self, scan: ExpiryScan) {
 		let len = self.evict.len();
+		let retention = self.retention(scan);
 		if len > 0 {
 			let start = scan.start % len;
 			let mut retained = 0;
@@ -1024,6 +1074,10 @@ impl TrackState {
 					continue;
 				}
 				if self.protects(sequence) || !slot.is_expired(&scan) {
+					if self.outlived(sequence, &retention) && slot.abort_unused(Error::Old) {
+						self.lookup.remove(&sequence);
+						continue;
+					}
 					// Writes keep their scan bounded. Cleanup visits the entire
 					// queue to date pending accesses and find idle entries behind them.
 					retained += 1;
@@ -1064,6 +1118,26 @@ impl TrackState {
 			self.evict
 				.retain(|(sequence, stamp)| lookup.get(sequence).is_some_and(|slot| slot.stamp == *stamp));
 		}
+	}
+
+	/// The track's retention budget and the edge it is measured against, once per scan;
+	/// `None` without a retention bound, or on a write's scan.
+	///
+	/// Judged on the pool's sweep alone: on every write it costs each append a successor
+	/// lookup per candidate, while readers skip what retention would drop either way.
+	fn retention(&self, scan: ExpiryScan) -> Option<(Duration, Edge)> {
+		if !scan.gc {
+			return None;
+		}
+		Some((self.max_age_bound()?, self.drift_edge(None)))
+	}
+
+	/// Whether retention gives up on `sequence`: stale under the publisher's window, which
+	/// has no reader's cap.
+	fn outlived(&self, sequence: u64, retention: &Option<(Duration, Edge)>) -> bool {
+		retention
+			.as_ref()
+			.is_some_and(|(budget, edge)| self.is_stale(sequence, edge, *budget))
 	}
 
 	/// Whether `(sequence, stamp)` names the currently cached incarnation.
@@ -1204,6 +1278,7 @@ impl TrackState {
 				visible,
 				pending,
 				head: None,
+				arrival: Default::default(),
 			},
 		);
 		if visible && !pending {
@@ -1236,9 +1311,10 @@ impl TrackState {
 		}
 	}
 
-	/// Content at `sequence` became servable: wake the reads it succeeds, and show an answer
-	/// waiting on it.
+	/// Content at `sequence` became servable: start its arrival clock, wake the reads it
+	/// succeeds, and show an answer waiting on it.
 	fn landed(&mut self, sequence: u64) {
+		self.cache.landed();
 		let below = self
 			.lookup
 			.range(..sequence)
@@ -2266,8 +2342,7 @@ impl Producer {
 	/// The read cursor starts at the group the subscription named (its floor), or 0.
 	/// [`Subscription::max_delay`] is what asks for data: delivery skips everything above
 	/// the floor that the budget convicts, so the default budget of zero delivers only
-	/// the latest group and a larger one reaches back over what it can still use. An
-	/// untimed track has nothing to convict, so it starts at its latest group.
+	/// the latest group and a larger one reaches back over what it can still use.
 	pub fn subscribe(&self, subscription: impl Into<Option<Subscription>>) -> Subscriber {
 		let preferences = subscription.into().unwrap_or_default();
 
@@ -3007,8 +3082,7 @@ impl Consumer {
 	/// The read cursor starts at the group the subscription named (its floor), or 0.
 	/// [`Subscription::max_delay`] is what asks for data: delivery skips everything above
 	/// the floor that the budget convicts, so the default budget of zero delivers only
-	/// the latest group and a larger one reaches back over what it can still use. An
-	/// untimed track has nothing to convict, so it starts at its latest group.
+	/// the latest group and a larger one reaches back over what it can still use.
 	pub fn subscribe(&self, subscription: impl Into<Option<Subscription>>) -> kio::Pending<Subscribing> {
 		let subscription = kio::Producer::new(subscription.into().unwrap_or_default());
 
@@ -3108,10 +3182,10 @@ impl Consumer {
 		}
 	}
 
-	/// Poll for group `sequence` falling a full `budget` behind this track's live edge,
-	/// as a reader would judge it, whether the track holds it or not; see
-	/// `TrackState::drifted`. Parks in this track's expiry index, so only a change that can
-	/// make the group stale, or land it here, wakes it. Pending for good once the track closes.
+	/// Poll for group `sequence` going stale on this track, as a reader would judge it,
+	/// whether the track holds it or not; see `TrackState::is_stale`. Parks in this track's
+	/// expiry index and its pool's wall clock, so only a change that can make the group
+	/// stale, or land it here, wakes it.
 	pub(crate) fn poll_stale(&self, sequence: u64, budget: Duration, waiter: &kio::Waiter) -> Poll<()> {
 		let state = self.state.read();
 		state.cache.wakes().watch_held(sequence, waiter);
@@ -3832,18 +3906,10 @@ struct Cursor {
 
 impl Cursor {
 	fn new(state: kio::Consumer<TrackState>, subscription: kio::Producer<Subscription>) -> Self {
-		// An explicit start says how far back to reach, so only an unfloored subscription
-		// jumps to an untimed track's latest group.
 		let (min_sequence, datagram_index) = {
 			let preferences = subscription.read();
 			let state = state.read();
-			let min_sequence = match preferences.start {
-				Some(_) => floor_of(&preferences),
-				None => {
-					let cap = preferences.end.and_then(|end| Cap::from(end.group_end()).exclusive());
-					state.untimed_start(cap).unwrap_or(0)
-				}
-			};
+			let min_sequence = floor_of(&preferences);
 			// Arrival order need not be timestamp order. Only skip the initial stale prefix;
 			// subsequent delivery stays in arrival order, including late datagrams.
 			let newest = state.datagrams.iter().filter_map(|datagram| datagram.timestamp).max();
@@ -5115,8 +5181,8 @@ mod test {
 	#[test]
 	fn recv_datagram_leaves_the_ordered_cursor_alone() {
 		let mut producer = track_producer("test", Info::timed());
-		let mut datagrams = producer.subscribe(None);
-		let mut subscriber = producer.subscribe(None).ordered();
+		let mut datagrams = producer.subscribe(replay());
+		let mut subscriber = producer.subscribe(replay()).ordered();
 		let ts = Timestamp::from_millis(5).unwrap();
 
 		producer
@@ -5849,7 +5915,7 @@ mod test {
 		let producer = track_producer_expiring("test", cache::DEFAULT_EXPIRY);
 		producer.append_group().unwrap().finish().unwrap();
 		let mut live = producer.append_group().unwrap();
-		let mut consumer = producer.subscribe(None);
+		let mut consumer = producer.subscribe(replay());
 		assert_eq!(consumer.assert_group().sequence, 0);
 		assert_eq!(consumer.assert_group().sequence, 1);
 
@@ -5911,20 +5977,169 @@ mod test {
 		assert!(expired, "a forwarded datagram runs expiry");
 	}
 
-	/// A track's `max_age` is a media-timestamp budget: it does not drive wall-clock
-	/// eviction, so a stall (no accesses, no timestamp progress) shorter than the
-	/// pool's LRU window can't age content out no matter how small the window is.
+	/// The sequences `producer` still caches.
+	fn cached(producer: &Producer) -> Vec<u64> {
+		producer.state.read().lookup.keys().copied().collect()
+	}
+
+	/// Append a finished one-frame group stamped at `ms`.
+	fn append_frozen(producer: &Producer, ms: u64) -> u64 {
+		let mut group = producer.append_group().unwrap();
+		group
+			.write_frame(Timestamp::from_millis(ms).unwrap(), b"x".as_slice())
+			.unwrap();
+		group.finish().unwrap();
+		group.sequence
+	}
+
+	/// A wall clock waking `flag`, for reads parked until it fires.
+	fn flagged() -> (Arc<std::sync::atomic::AtomicBool>, kio::Waiter) {
+		let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let waiter = kio::Waiter::new(futures::task::waker(Arc::new(FlagWake(flag.clone()))));
+		(flag, waiter)
+	}
+
+	/// A stalled track keeps its newest group and drops the superseded ones once their
+	/// successors arrived `max_age` ago, though nothing is written and no timestamp moves.
 	#[test]
-	fn max_age_does_not_drive_wall_eviction() {
+	fn a_stalled_track_drops_superseded_groups_by_the_wall_clock() {
 		let producer = track_producer("test", Info::timed().with_max_age(Duration::from_secs(1)));
-		producer.append_group().unwrap(); // seq 0
+		let pool = producer.broadcast.pool.clone();
+		elapse(&producer, Duration::ZERO);
+		for _ in 0..3 {
+			append_frozen(&producer, 0);
+		}
 
-		// Far past max_age in wall time, but inside the pool's LRU window.
-		elapse(&producer, Duration::from_secs(10));
-		producer.append_group().unwrap(); // seq 1
+		elapse(&producer, Duration::from_millis(999));
+		pool.sweep();
+		assert_eq!(cached(&producer), [0, 1, 2]);
 
-		let state = producer.state.read();
-		assert_eq!(live_groups(&state), 2, "max_age is media time, not a wall clock");
+		elapse(&producer, Duration::from_millis(1));
+		pool.sweep();
+		assert_eq!(cached(&producer), [2], "the newest group is never stale");
+		assert_eq!(drain(&mut producer.subscribe(replay())), [2]);
+	}
+
+	/// A track still writing but whose timestamps stopped advancing ages out by the wall
+	/// clock.
+	#[test]
+	fn a_track_whose_timestamps_stall_still_ages_out_by_the_wall_clock() {
+		let producer = track_producer("test", Info::timed().with_max_age(Duration::from_secs(1)));
+		elapse(&producer, Duration::ZERO);
+		for _ in 0..4 {
+			append_frozen(&producer, 0);
+			elapse(&producer, Duration::from_millis(400));
+		}
+		append_frozen(&producer, 0);
+
+		producer.broadcast.pool.sweep();
+		// Group 0's successor arrived 1.2s before the sweep, group 1's only 800ms.
+		assert_eq!(cached(&producer), [1, 2, 3, 4]);
+	}
+
+	/// A startup burst lands at one instant, so only media time can tell its old groups
+	/// from the live edge.
+	#[test]
+	fn a_startup_burst_ages_out_by_media_time() {
+		let producer = track_producer("test", Info::timed().with_max_age(Duration::from_secs(1)));
+		elapse(&producer, Duration::ZERO);
+		for second in 0..5 {
+			append_frozen(&producer, second * 1000);
+		}
+
+		producer.broadcast.pool.sweep();
+		// Group 2 reaches 3s, a full second behind the edge at 4s; group 3 reaches 4s.
+		assert_eq!(cached(&producer), [3, 4]);
+	}
+
+	/// Retention spares a stale group a reader still holds; its own budget decides.
+	#[test]
+	fn retention_spares_a_group_a_reader_holds() {
+		let producer = track_producer("test", Info::timed().with_max_age(Duration::from_secs(1)));
+		let pool = producer.broadcast.pool.clone();
+		elapse(&producer, Duration::ZERO);
+		let mut subscriber = producer.subscribe(replay());
+		append_frozen(&producer, 0);
+		let held = subscriber.assert_group();
+		append_frozen(&producer, 0);
+
+		elapse(&producer, Duration::from_secs(2));
+		pool.sweep();
+		assert_eq!(cached(&producer), [0, 1], "a reader holds group 0");
+
+		drop(held);
+		pool.sweep();
+		assert_eq!(cached(&producer), [1]);
+	}
+
+	/// A read parked on a superseded group is released by the wall clock alone, at its
+	/// successor's arrival plus its budget, with nothing written after the successor.
+	#[test]
+	fn a_parked_read_wakes_at_its_successors_wall_deadline() {
+		let mut producer = untimed_producer();
+		let pool = producer.broadcast.pool.clone();
+		let start = crate::model::clock::now();
+		pool.gc(start);
+		let mut subscriber = producer.subscribe(Subscription::default().with_max_delay(Duration::from_secs(1)));
+		let mut open = producer.append_group().unwrap();
+		open.write_frame(None, b"x".as_slice()).unwrap();
+		let mut reading = subscriber.assert_group();
+		let (woken, waiter) = flagged();
+		assert!(matches!(reading.poll_read_frame(&waiter), Poll::Ready(Ok(Some(_)))));
+		assert!(reading.poll_read_frame(&waiter).is_pending());
+
+		append_untimed(&mut producer);
+		// The pass right after the landing dates it.
+		pool.gc(start);
+		assert!(reading.poll_read_frame(&waiter).is_pending());
+
+		woken.store(false, Ordering::SeqCst);
+		pool.gc(start + Duration::from_millis(999));
+		assert!(!woken.load(Ordering::SeqCst), "woken before the deadline");
+		pool.gc(start + Duration::from_secs(1));
+		assert!(woken.load(Ordering::SeqCst), "the wall deadline lost its wakeup");
+		assert!(matches!(reading.poll_read_frame(&waiter), Poll::Ready(Ok(None))));
+	}
+
+	/// The wall clock follows whichever group is the successor now: one landing below it
+	/// restarts the clock, and its abort hands the clock back.
+	#[test]
+	fn the_wall_clock_follows_the_current_successor() {
+		for abort in [false, true] {
+			let producer = untimed_producer();
+			let pool = producer.broadcast.pool.clone();
+			let start = crate::model::clock::now();
+			pool.gc(start);
+			let mut subscriber = producer.subscribe(Subscription::default().with_max_delay(Duration::from_secs(1)));
+			let mut open = producer.create_group(0u64.into()).unwrap();
+			open.write_frame(None, b"x".as_slice()).unwrap();
+			let mut reading = subscriber.assert_group();
+			let (woken, waiter) = flagged();
+			assert!(matches!(reading.poll_read_frame(&waiter), Poll::Ready(Ok(Some(_)))));
+
+			// Group 2 lands first, then group 1 below it 600ms later.
+			let mut later = producer.create_group(2u64.into()).unwrap();
+			later.write_frame(None, b"x".as_slice()).unwrap();
+			pool.gc(start);
+			assert!(reading.poll_read_frame(&waiter).is_pending());
+			pool.gc(start + Duration::from_millis(600));
+			let mut lower = producer.create_group(1u64.into()).unwrap();
+			lower.write_frame(None, b"x".as_slice()).unwrap();
+			pool.gc(start + Duration::from_millis(600));
+			assert!(reading.poll_read_frame(&waiter).is_pending());
+
+			if abort {
+				lower.abort(Error::Cancel).unwrap();
+				assert!(woken.load(Ordering::SeqCst), "the successor's abort lost its wakeup");
+			}
+			pool.gc(start + Duration::from_secs(1));
+			let expired = matches!(reading.poll_read_frame(&waiter), Poll::Ready(Ok(None)));
+			assert_eq!(expired, abort, "group 2 succeeds it again only once group 1 is gone");
+			if !abort {
+				pool.gc(start + Duration::from_millis(1600));
+				assert!(matches!(reading.poll_read_frame(&waiter), Poll::Ready(Ok(None))));
+			}
+		}
 	}
 
 	/// Disabling the pool's expiry keeps idle groups until byte pressure reclaims them.
@@ -6010,23 +6225,26 @@ mod test {
 		assert_eq!(under.state.read().max_age_bound(), Some(Duration::from_millis(500)));
 	}
 
-	/// The origin ceiling clamps the media-timestamp budget only; wall-clock
-	/// reclamation belongs to the pool's LRU window, not the ceiling.
+	/// The origin ceiling bounds retention like a shorter publisher window, from the
+	/// successor's arrival rather than the group's own.
 	#[test]
-	fn origin_cache_duration_does_not_wall_evict() {
+	fn origin_cache_duration_bounds_retention() {
 		let producer = track_producer_capped(
 			"test",
 			Info::timed().with_max_age(Duration::from_secs(60)),
 			Duration::from_secs(1),
 		);
+		elapse(&producer, Duration::ZERO);
 		producer.append_group().unwrap(); // seq 0
 
-		// Far past the ceiling in wall time, but inside the pool's LRU window.
+		// Long past the ceiling, but only since group 0 itself arrived.
 		elapse(&producer, Duration::from_secs(2));
 		producer.append_group().unwrap(); // seq 1
+		assert_eq!(cached(&producer), [0, 1]);
 
-		let state = producer.state.read();
-		assert_eq!(live_groups(&state), 2);
+		elapse(&producer, Duration::from_secs(1));
+		producer.broadcast.pool.sweep();
+		assert_eq!(cached(&producer), [1]);
 	}
 
 	#[test]
@@ -6407,7 +6625,8 @@ mod test {
 			.unwrap();
 		append_at(&mut producer, 1000);
 		append_at(&mut producer, 20_000);
-		let mut sub = producer.subscribe(None);
+		// No pass dates an arrival here, so only media time judges a non-zero budget.
+		let mut sub = producer.subscribe(Subscription::default().with_max_delay(Duration::from_secs(15)));
 		let mut reading = sub.recv_group().await.unwrap().unwrap();
 		assert_eq!(reading.sequence, 0, "the rewound successor extends the reach");
 		assert!(reading.read_frame().await.unwrap().is_some());
@@ -7138,16 +7357,18 @@ mod test {
 	#[test]
 	fn an_unstamped_immediate_successor_leaves_reach_unbounded() {
 		let mut producer = track_producer("test", Info::timed());
-		let mut subscriber = producer.subscribe(None);
+		// No pass dates an arrival here, so only media time judges a non-zero budget.
+		let mut subscriber = producer.subscribe(Subscription::default().with_max_delay(Duration::from_secs(1)));
 
 		append_at(&mut producer, 0); // seq 0
 		producer.append_group().unwrap(); // seq 1 stalls before its first frame
 		append_at(&mut producer, 10_000); // seq 2
+		append_at(&mut producer, 11_000); // seq 3
 
-		// Group 1's reach is group 2's start, a full edge behind: stale at zero budget.
+		// Group 1's reach is group 2's start, a full budget behind the edge: stale.
 		// Group 0's reach is unknown until group 1 presents its first frame, so it is
 		// kept rather than convicted on a bound that could shrink the wrong way.
-		assert_eq!(drain(&mut subscriber), vec![0, 2]);
+		assert_eq!(drain(&mut subscriber), vec![0, 2, 3]);
 	}
 
 	/// Reach is the *immediate* successor's start, never a minimum across later groups.
@@ -7205,30 +7426,29 @@ mod test {
 		group.sequence
 	}
 
-	/// Nothing on an untimed track is ever stale, so a budget can't resolve where a new
-	/// subscriber starts. It takes the latest group instead of replaying the cache.
+	/// The wall clock judges an untimed group, so a new subscriber starts at the oldest cached
+	/// group its budget still holds, the latest one at zero.
 	#[test]
-	fn an_untimed_track_starts_at_its_latest_group() {
+	fn an_untimed_subscriber_starts_at_the_oldest_group_that_is_not_stale() {
 		let mut producer = untimed_producer();
+		elapse(&producer, Duration::ZERO);
 		for _ in 0..5 {
 			append_untimed(&mut producer);
+			elapse(&producer, Duration::from_secs(1));
 		}
 
 		let mut live = producer.subscribe(None);
 		assert_eq!(drain(&mut live), vec![4]);
-		let mut patient = producer.subscribe(replay());
-		assert_eq!(
-			drain(&mut patient),
-			vec![4],
-			"no budget reaches back on an untimed track"
-		);
+		// Groups 0 and 1 were superseded 4s and 3s ago, group 2 only 2s ago.
+		let mut patient = producer.subscribe(Subscription::default().with_max_delay(Duration::from_millis(2500)));
+		assert_eq!(drain(&mut patient), vec![2, 3, 4]);
 
 		append_untimed(&mut producer);
 		assert_eq!(drain(&mut live), vec![5], "every later group is delivered");
 	}
 
-	/// An explicit start says how far back to reach, so it wins over the untimed jump to
-	/// the latest group (a resume after failover names the group it lacks).
+	/// An explicit start is a floor on what the budget replays (a resume after failover
+	/// names the group it lacks).
 	#[test]
 	fn an_explicit_start_holds_on_an_untimed_track() {
 		let mut producer = untimed_producer();
@@ -7236,7 +7456,7 @@ mod test {
 			append_untimed(&mut producer);
 		}
 
-		let mut subscriber = producer.subscribe(Subscription::default().with_start(Position::group(2)));
+		let mut subscriber = producer.subscribe(replay().with_start(Position::group(2)));
 		assert_eq!(drain(&mut subscriber), vec![2, 3, 4]);
 	}
 
@@ -7374,11 +7594,13 @@ mod test {
 		append_at(&mut producer, 0); // seq 0
 		producer.append_group().unwrap(); // seq 1 stalls before its first frame
 		append_at(&mut producer, 10_000); // seq 2
+		append_at(&mut producer, 11_000); // seq 3
 
-		// Group 1 reaches 10s, a full edge behind: convicted. Group 0 is bounded only by
-		// group 1, which has yet to say where it begins.
-		let mut subscriber = producer.subscribe(None).ordered();
-		assert_eq!(drain_ordered(&mut subscriber), vec![0, 2]);
+		// Group 1 reaches 10s, a full budget behind: convicted. Group 0 is bounded only by
+		// group 1, which has yet to say where it begins. No pass dates an arrival here.
+		let budget = Subscription::default().with_max_delay(Duration::from_secs(1));
+		let mut subscriber = producer.subscribe(budget).ordered();
+		assert_eq!(drain_ordered(&mut subscriber), vec![0, 2, 3]);
 	}
 
 	#[test]
@@ -7844,7 +8066,7 @@ mod test {
 		producer.create_group(group::Info { sequence: 2 }).unwrap();
 		producer.finish_at(Position::group(4)).unwrap();
 
-		let mut ordered = producer.subscribe(None).ordered();
+		let mut ordered = producer.subscribe(replay()).ordered();
 		drop(producer);
 
 		let first = ordered.next_group().now_or_never().expect("group 0").unwrap().unwrap();
@@ -8086,7 +8308,7 @@ mod test {
 	#[moq_net_sim::test]
 	async fn a_pending_tail_holds_readers_at_a_hole() {
 		let mut producer = track_producer("test", None);
-		let mut arrival = producer.subscribe(None);
+		let mut arrival = producer.subscribe(replay());
 		// The wire declares where the feed starts.
 		producer.start_at(0).unwrap();
 		producer.finish_at_pending(Position::group(3)).unwrap();
@@ -8104,7 +8326,7 @@ mod test {
 
 		// A settled tail ends readers at the boundary, hole and all.
 		let mut producer = track_producer("test", None);
-		let mut arrival = producer.subscribe(None);
+		let mut arrival = producer.subscribe(replay());
 		producer.start_at(0).unwrap();
 		producer.finish_at_pending(Position::group(2)).unwrap();
 		let _high = producer.create_group(group::Info { sequence: 1 }).unwrap();
@@ -8115,7 +8337,7 @@ mod test {
 
 		// So does the last producer going.
 		let mut producer = track_producer("test", None);
-		let mut arrival = producer.subscribe(None);
+		let mut arrival = producer.subscribe(replay());
 		producer.start_at(0).unwrap();
 		producer.finish_at_pending(Position::group(2)).unwrap();
 		let _high = producer.create_group(group::Info { sequence: 1 }).unwrap();
@@ -8169,7 +8391,7 @@ mod test {
 	#[moq_net_sim::test]
 	async fn an_end_after_the_highest_group_holds_the_reader() {
 		let mut producer = track_producer("test", None);
-		let mut arrival = producer.subscribe(None);
+		let mut arrival = producer.subscribe(replay());
 		producer.start_at(0).unwrap();
 		let _high = producer.create_group(group::Info { sequence: 2 }).unwrap();
 		assert_eq!(arrival.assert_group().sequence, 2);
@@ -8198,7 +8420,7 @@ mod test {
 	#[test]
 	fn abort_before_the_end_settles_wins() {
 		let mut producer = track_producer("test", Info::timed());
-		let mut consumer = producer.subscribe(None);
+		let mut consumer = producer.subscribe(replay());
 
 		let head = producer.create_group(group::Info { sequence: 0 }).unwrap();
 		head.finish().unwrap();
@@ -8262,8 +8484,8 @@ mod test {
 	#[test]
 	fn abort_keeps_finished_groups_for_a_slow_reader() {
 		let producer = track_producer("test", Info::timed());
-		let mut arrival = producer.subscribe(None);
-		let mut ordered = producer.subscribe(None).ordered();
+		let mut arrival = producer.subscribe(replay());
+		let mut ordered = producer.subscribe(replay()).ordered();
 
 		for sequence in 0..2 {
 			producer
@@ -8347,7 +8569,7 @@ mod test {
 	#[test]
 	fn abort_after_the_end_settles_ends_clean() {
 		let mut producer = track_producer("test", Info::timed());
-		let mut consumer = producer.subscribe(None);
+		let mut consumer = producer.subscribe(replay());
 
 		for sequence in 0..2 {
 			let group = producer.create_group(group::Info { sequence }).unwrap();
@@ -8367,7 +8589,7 @@ mod test {
 	#[test]
 	fn abort_after_the_end_settles_ends_clean_for_an_ordered_reader() {
 		let mut producer = track_producer("test", Info::timed());
-		let mut consumer = producer.subscribe(None).ordered();
+		let mut consumer = producer.subscribe(replay()).ordered();
 
 		for sequence in 0..2 {
 			let group = producer.create_group(group::Info { sequence }).unwrap();
@@ -8925,7 +9147,7 @@ mod test {
 	fn empty_local_cap_holds_while_another_subscriber_requests_everything() {
 		let producer = track_producer("test", Info::timed());
 		let mut everything = producer.subscribe(replay());
-		let mut empty = producer.subscribe(Subscription::default().with_end(Position::group(0)));
+		let mut empty = producer.subscribe(replay().with_end(Position::group(0)));
 		empty.set_groups((Bound::Unbounded, Position::group(0).group_end()));
 
 		for s in 0..3 {

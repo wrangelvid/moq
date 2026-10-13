@@ -128,4 +128,42 @@ for (const held of heldCounts) {
 		}
 	}
 }
+// A late subscriber replays a track whose timestamps stopped advancing, so only the wall
+// clock since each successor arrived convicts its backlog: half the cache is stale.
+const cachedCounts = [1, 10, 100, 1000];
+
+function replay(cached: number): { us: number; delivered: number } {
+	const producer = new Producer("bench").accept({ timescale: Timescale.MILLI, maxAge: Milli(3_600_000) });
+	for (let index = 0; index < cached; index++) {
+		clock += 1;
+		const group = producer.appendGroup();
+		group.writeFrame({ payload, timestamp: Timestamp.fromMillis(0) });
+		group.close();
+	}
+	const subscriber = producer.subscribe({ maxDelay: Milli(Math.max(1, cached / 2)) });
+	const start = now();
+	let delivered = 0;
+	for (let group = subscriber.tryRecvGroup(); group; group = subscriber.tryRecvGroup()) {
+		checksum += group.sequence + 1;
+		delivered++;
+	}
+	const us = ((now() - start) * 1000) / cached;
+	subscriber.close();
+	producer.close();
+	return { us, delivered };
+}
+
+for (let rep = 0; rep < reps; rep++) replay(100);
+console.log("cached,delivered,replay_us_per_cached");
+let replayBaseline: number | undefined;
+for (const cached of cachedCounts) {
+	const samples = Array.from({ length: reps }, () => replay(cached));
+	const us = Math.min(...samples.map((sample) => sample.us));
+	console.log(`${cached},${samples[0].delivered},${us.toFixed(2)}`);
+	replayBaseline ??= us;
+	if (cached >= 100 && us > replayBaseline * maxSlope) {
+		throw new Error(`replaying ${cached} cached groups costs ${us.toFixed(2)} us/group, over ${maxSlope}x`);
+	}
+}
+
 if (checksum === 0) throw new Error("benchmark did no work");

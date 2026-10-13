@@ -106,7 +106,7 @@ pub struct Config {
 	/// one policy.
 	pub pool: cache::Pool,
 
-	/// Ceiling on each track's media-timestamp retention window under this origin.
+	/// Ceiling on each track's retention window under this origin.
 	/// This caps the local retention and delivery budget without changing the
 	/// publisher's [`max_age`](track::Info::max_age) metadata. Wall-clock
 	/// reclamation of idle content is separate: [`Self::pool`]'s
@@ -2368,7 +2368,8 @@ pub struct Driver {
 	// Shared by this origin's lifecycle tasks; advanced only when polled.
 	timers: Clock,
 	// The cache pool this origin's groups charge into, swept on a wall-clock
-	// cadence so its idle window binds a track whose publisher stopped writing.
+	// cadence so its idle window binds a track whose publisher stopped writing, and
+	// passed whenever a group lands or a reader's wall-clock deadline comes due.
 	pool: cache::Pool,
 }
 
@@ -2398,7 +2399,8 @@ impl Driver {
 			if result.is_ready() {
 				return Err(Error::Closed);
 			}
-			Ok(self.timers.park(waiter).into_iter().chain(gc).min())
+			let pool = self.pool.park(waiter);
+			Ok(self.timers.park(waiter).into_iter().chain(gc).chain(pool).min())
 		})
 	}
 }

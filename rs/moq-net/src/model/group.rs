@@ -911,6 +911,11 @@ impl Producer {
 		self.alive.aborted.load(Ordering::Acquire)
 	}
 
+	/// Whether a consumer of the group exists, so dropping it would cut a reader short.
+	pub(crate) fn is_used(&self) -> bool {
+		self.state.is_used()
+	}
+
 	/// Whether the group was finished: it holds every frame it will ever have.
 	pub(crate) fn is_finished(&self) -> bool {
 		self.state.read().fin.is_some()

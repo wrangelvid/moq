@@ -215,9 +215,11 @@ duration = "30s"                     # Cap how long a non-latest group is kept, 
 ```
 
 `capacity` is a byte target, repaid as active publishers write. `duration`
-(30s by default) bounds memory by age, and sweeps on a timer, so a publisher
-that stalls but stays connected still has its idle groups reclaimed. The latest
-group of every track is always kept, even past `capacity`.
+(30s by default) bounds memory by age: a superseded group nobody reads goes
+once it is that far behind, by its successor's arrival or by media time, and an
+idle one once nobody touched it for that long. Both sweep on a timer, so a publisher that stalls but stays
+connected still has them reclaimed. The latest group of every track is always
+kept, even past `capacity`.
 
 ## \[stats]
 

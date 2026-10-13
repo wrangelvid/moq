@@ -27,13 +27,15 @@ struct Relay {
 	_origins: (moq_net::origin::Producer, moq_net::origin::Producer),
 }
 
-/// A publisher on `version` with group 0 of an untimed track written, and the relay's view of it.
-async fn relay(version: &str) -> Relay {
+/// A publisher on `version` with group 0 of an untimed track written, retained for
+/// `max_age`, and the relay's view of it.
+async fn relay(version: &str, max_age: Option<Duration>) -> Relay {
 	let publisher = produce_origin(1);
 	let broadcast = publisher.create_broadcast("bcast").unwrap();
-	let mut track = broadcast
-		.create_track("video", moq_net::track::Info::default().with_timescale(None))
-		.unwrap();
+	let info = moq_net::track::Info::default()
+		.with_timescale(None)
+		.with_max_age(max_age);
+	let mut track = broadcast.create_track("video", info).unwrap();
 	broadcast.announce(Default::default()).unwrap();
 	track.write_frame(None, &b"0"[..]).unwrap();
 
@@ -74,7 +76,7 @@ async fn fetch_err(relay: &Relay, sequence: u64) -> moq_net::Error {
 #[moq_net_sim::test]
 async fn a_fetch_is_served_from_the_live_feed() {
 	for version in VERSIONS {
-		let mut relay = relay(version).await;
+		let mut relay = relay(version, None).await;
 		let mut subscriber = moq_net_sim::timeout(TIMEOUT, relay.remote.track("video").unwrap().subscribe(None))
 			.await
 			.expect("subscribe timeout")
@@ -113,7 +115,7 @@ async fn a_fetch_is_served_from_the_live_feed() {
 #[moq_net_sim::test]
 async fn a_fetch_waits_for_a_feed_opened_with_it() {
 	for version in VERSIONS {
-		let mut relay = relay(version).await;
+		let mut relay = relay(version, None).await;
 		let err = fetch_err(&relay, 0).await;
 		assert!(matches!(err, moq_net::Error::NotFound), "{version}: no feed: {err}");
 
@@ -142,13 +144,13 @@ async fn a_fetch_waits_for_a_feed_opened_with_it() {
 #[moq_net_sim::test]
 async fn an_unfed_fetch_is_a_miss() {
 	for version in VERSIONS {
-		let mut relay = relay(version).await;
+		let mut relay = relay(version, Some(Duration::ZERO)).await;
 		let err = fetch_err(&relay, 0).await;
 		assert!(matches!(err, moq_net::Error::NotFound), "{version}: no feed: {err}");
 
 		relay.track.write_frame(None, &b"1"[..]).unwrap();
 		relay.track.write_frame(None, &b"2"[..]).unwrap();
-		// Unfloored on an untimed track, the feed starts at the newest group.
+		// The publisher keeps only its live edge, so the feed starts at the newest group.
 		let mut subscriber = moq_net_sim::timeout(TIMEOUT, relay.remote.track("video").unwrap().subscribe(None))
 			.await
 			.expect("subscribe timeout")

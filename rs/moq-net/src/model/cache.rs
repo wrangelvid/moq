@@ -22,11 +22,13 @@
 //! nobody has read or written for that long is reclaimed, no matter what retention
 //! its track advertises. Only a live track's latest group is exempt: once a track
 //! ends, a stale consumer can't pin any of it. Track retention
-//! ([`max_age`](crate::track::Info::max_age)) is measured in media timestamps, so a
-//! congestion stall can't age content out; the pool's expiry is the orthogonal
-//! wall-clock bound that keeps unwatched content from pinning RAM.
+//! ([`max_age`](crate::track::Info::max_age)) ages a superseded group from its
+//! successor's arrival, on this pool's clock, or by media time; the pool's expiry is the
+//! orthogonal bound that keeps unwatched content from pinning RAM.
 //!
-//! Expiry is driven by [`Pool::gc`], also called by each origin driver.
+//! Expiry is driven by [`Pool::gc`], also called by each origin driver. Each call is a
+//! pass of the pool's wall clock, which dates the groups that landed since the last one,
+//! so a group never reads as older than it is: the driver is woken for the pass.
 //! Reads and writes clear the expiration timestamp without reading a clock.
 //! The next cleanup pass dates that activity at its supplied instant. Delayed
 //! cleanup extends retention; standalone pools must call `gc` too.
@@ -38,7 +40,7 @@
 //! [`DEFAULT_EXPIRY`], while a relay creates one configured pool and shares it across
 //! every origin so the whole process caches into a single policy.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
@@ -104,8 +106,8 @@ impl Config {
 	/// A cached group (other than a live track's latest) that nobody reads or writes
 	/// for this long is reclaimed, surfacing to any remaining reader as
 	/// [`Error::Old`](crate::Error::Old). This is independent of track retention:
-	/// [`max_age`](crate::track::Info::max_age) uses media timestamps, while this
-	/// window keeps idle content from pinning memory. Reclaiming without a write behind
+	/// [`max_age`](crate::track::Info::max_age) ages a group from its successor's arrival,
+	/// while this window keeps idle content from pinning memory. Reclaiming without a write behind
 	/// it needs [`Pool::gc`] called periodically (origins do this automatically).
 	/// The value is fixed when the
 	/// pool is created. Values are rounded up to the pool's 100 ms clock tick, with
@@ -155,6 +157,9 @@ struct Inner {
 	// budget needs no registry, since a track that never writes never grows the pool.
 	// Weak, because a track owns its account and the account must not outlive it.
 	tracks: kio::Lock<slab::Slab<Weak<Track>>>,
+	// The wall clock each pass advances, which ages a superseded group from its
+	// successor's arrival for retention and for readers' budgets.
+	wall: expiry::Wall,
 }
 
 struct Clock {
@@ -189,6 +194,7 @@ impl Pool {
 				access_sum: AtomicU64::new(0),
 				access_count: AtomicU64::new(0),
 				tracks: kio::Lock::new(slab::Slab::new()),
+				wall: expiry::Wall::default(),
 			}),
 		}
 	}
@@ -264,13 +270,16 @@ impl Pool {
 	/// Collect idle cache entries and return the next cleanup time.
 	///
 	/// Call after polling and at the returned deadline, including when idle.
-	/// Calls before that deadline only advance the pool's sampled clock. A due
-	/// pass visits every cached group, dating accesses since the last pass and
-	/// reclaiming idle groups except each live track's latest. Delayed calls extend
+	/// Every call advances the pool's sampled clock, which dates the groups that arrived
+	/// since the last call and ages a superseded group from its successor's arrival (see
+	/// [`max_age`](crate::track::Info::max_age)). A due pass visits every cached group,
+	/// dating accesses since the last pass and reclaiming idle groups except each live
+	/// track's latest, and groups past their track's retention. Delayed calls extend
 	/// retention. Shared pools use the latest supplied instant.
 	///
-	/// `None` means both cache policies are disabled. After enabling a capacity
-	/// with [`Self::resize`], call this again to resume periodic clock sampling.
+	/// `None` means both cache policies are disabled and no reader waits on the clock.
+	/// After enabling a capacity with [`Self::resize`], call this again to resume periodic
+	/// clock sampling.
 	pub fn gc(&self, now: crate::time::Instant) -> Option<crate::time::Instant> {
 		self.advance(now, true)
 	}
@@ -288,13 +297,26 @@ impl Pool {
 			.expect("cache clock overflow");
 		self.inner.tick.store(tick, Ordering::Relaxed);
 		clock.now = now;
+		// Before the sweep, so retention judges the arrivals this pass dates.
+		let wall = self.inner.wall.pass(now);
 		if self.sweep_interval().is_none() {
 			clock.sweep = None;
 		} else if sweep && clock.sweep.is_none_or(|at| at <= now) {
 			self.sweep();
 			clock.sweep = self.sweep_interval().and_then(|interval| now.checked_add(interval));
 		}
-		clock.sweep
+		clock.sweep.into_iter().chain(wall).min()
+	}
+
+	/// The wall clock [`Self::gc`] advances.
+	pub(crate) fn wall(&self) -> &expiry::Wall {
+		&self.inner.wall
+	}
+
+	/// Register a driver's `waiter` for a [`Self::gc`] wanted sooner than the deadline the
+	/// last one returned, returning when that is: now, while landed groups wait for a date.
+	pub(crate) fn park(&self, waiter: &kio::Waiter) -> Option<crate::time::Instant> {
+		self.inner.wall.park(waiter)
 	}
 
 	/// Move the pool's sampled clock forward by `duration`, dating accesses on either
@@ -507,6 +529,9 @@ pub(crate) struct Track {
 	// The track's reads parked on their drift budget. Here because this account is the
 	// link every group's frame writes already follow back to the track.
 	wakes: expiry::Wakes,
+
+	// A group landed since the pool's last pass, which has this track to date.
+	landed: AtomicBool,
 }
 
 impl Track {
@@ -520,6 +545,7 @@ impl Track {
 			state,
 			sweep: OnceLock::new(),
 			wakes: Default::default(),
+			landed: AtomicBool::new(false),
 		});
 		if let Some(key) = track.pool.register(&track) {
 			let _ = track.sweep.set(key);
@@ -535,6 +561,21 @@ impl Track {
 	/// The track's reads parked on their drift budget.
 	pub(crate) fn wakes(&self) -> &expiry::Wakes {
 		&self.wakes
+	}
+
+	/// A group landed: have the pool's next pass date it, asking for that pass on the
+	/// first landing since the last.
+	pub(crate) fn landed(self: &Arc<Self>) {
+		if !self.landed.swap(true, Ordering::Relaxed) {
+			self.pool.wall().landed(Arc::downgrade(self));
+		}
+	}
+
+	/// Date the groups that landed since the pool's last pass at `at` on its wall clock.
+	pub(crate) fn date(&self, at: u64) {
+		// Cleared first, so a landing from here on asks the next pass again.
+		self.landed.store(false, Ordering::Relaxed);
+		self.state.read(|state| state.date_arrivals(at));
 	}
 
 	/// Charge a new group's fixed overhead, returning its [`Charge`].

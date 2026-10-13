@@ -265,3 +265,33 @@ async fn a_fetched_untimed_frame_arrives_untimed() {
 		assert_eq!(frame.timestamp.is_some(), lite, "{version}");
 	}
 }
+
+/// A reader parked on a superseded untimed group is released by its origin's driver once
+/// the successor arrived its budget ago, with nothing written after the successor.
+#[moq_net_sim::test]
+async fn the_origin_driver_releases_a_superseded_untimed_group() {
+	let origin = produce_origin(1);
+	let broadcast = origin.create_broadcast("room").unwrap();
+	let producer = broadcast.create_track("data", untimed()).unwrap();
+	let budget = Duration::from_secs(1);
+	let mut subscriber = producer.subscribe(track::Subscription::default().with_max_delay(budget));
+	let mut open = producer.append_group().unwrap();
+	open.write_frame(None, &b"held"[..]).unwrap();
+	let mut held = subscriber.recv_group().await.unwrap().expect("a group");
+	assert!(held.read_frame().await.unwrap().is_some());
+
+	moq_net_sim::sleep(Duration::from_millis(500)).await;
+	let landed = moq_net_sim::now();
+	let mut successor = producer.append_group().unwrap();
+	successor.write_frame(None, &b"next"[..]).unwrap();
+
+	let end = moq_net_sim::timeout(TIMEOUT, held.read_frame())
+		.await
+		.expect("the superseded group was never released");
+	assert!(matches!(end, Ok(None)), "{end:?}");
+	assert_eq!(
+		moq_net_sim::now() - landed,
+		budget,
+		"released at the successor's arrival plus its budget"
+	);
+}

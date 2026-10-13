@@ -376,16 +376,6 @@ async fn rejoin_during_the_cancel_skips_the_cache() {
 
 			let mut sub = remote.track("video").unwrap().subscribe(None).await.unwrap();
 			let group = sub.recv_group().await.unwrap().unwrap();
-			// A track that arrives untimed has no media age to skip the cached group by, so
-			// its reader starts at the newest group cached when it subscribed and reads on
-			// from there.
-			if sub.info().timescale.is_none() {
-				let mut sequence = group.sequence;
-				while sequence < 3 {
-					sequence = sub.recv_group().await.unwrap().unwrap().sequence;
-				}
-				return;
-			}
 			assert_eq!(
 				group.sequence, 3,
 				"{version}: the rejoining reader got the stale cache first"
@@ -454,11 +444,6 @@ async fn rejoin_waits_for_the_answers_first_frame() {
 
 			pair.server_transport.release_split();
 			let mut group = sub.recv_group().await.unwrap().unwrap();
-			// A track that arrives untimed has no media age to skip the cached group by, so
-			// its reader starts at the newest group cached and reads on from there.
-			if sub.info().timescale.is_none() && group.sequence == 0 {
-				group = sub.recv_group().await.unwrap().unwrap();
-			}
 			assert_eq!(group.sequence, 1, "{version}");
 			assert_eq!(read_all(&mut group).await.unwrap(), [b"new".to_vec()], "{version}");
 		})
