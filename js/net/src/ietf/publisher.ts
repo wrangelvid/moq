@@ -401,10 +401,13 @@ export class Publisher {
 					return;
 				}
 				const e = error(err);
+				const code = e instanceof StreamError ? e.code : undefined;
 				const condition =
-					e instanceof StreamError && (e.code === StreamCode.NotFound || e.code === StreamCode.Unroutable)
+					code === StreamCode.NotFound || code === StreamCode.Unroutable
 						? "does_not_exist"
-						: "internal";
+						: code === StreamCode.Unauthorized
+							? "unauthorized"
+							: "internal";
 				refusal = { errorCode: toRequestCode(condition, "subscribe", version), reasonPhrase: reason(e) };
 			}
 		}
@@ -704,6 +707,9 @@ export class Publisher {
 			// An update that broke the protocol, such as one whose AUTHORIZATION TOKEN names an
 			// alias, closes the session: the connection answers a thrown violation with its code.
 			if (publishError instanceof ProtocolViolation) throw publishError;
+			// An upstream's revocation, bridged from moq-lite, ends it the same way.
+			if (publishError instanceof StreamError && publishError.code === StreamCode.Unauthorized)
+				unauthorized = true;
 
 			// PUBLISH_DONE waits until every stream this subscription will open is closed, as
 			// the draft requires, so its count is final. The subscriber leaving cancels the

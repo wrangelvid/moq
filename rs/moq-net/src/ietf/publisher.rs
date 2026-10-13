@@ -940,7 +940,10 @@ where
 			// Send PublishDone
 			let (status, reason) = match &res {
 				Ok(()) => (ietf::PublishDoneStatus::TrackEnded, "track ended"),
-				Err(Error::Unauthorized) => (ietf::PublishDoneStatus::Unauthorized, "not granted"),
+				// Ours, or an upstream's revocation bridged from moq-lite.
+				Err(Error::Unauthorized | Error::Stream(crate::StreamError::Unauthorized)) => {
+					(ietf::PublishDoneStatus::Unauthorized, "not granted")
+				}
 				Err(Error::Unsupported) => (ietf::PublishDoneStatus::UpdateFailed, "update failed"),
 				Err(_) => (ietf::PublishDoneStatus::InternalError, "internal error"),
 			};

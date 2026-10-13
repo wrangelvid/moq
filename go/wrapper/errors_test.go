@@ -108,6 +108,16 @@ func TestErrorSentinels(t *testing.T) {
 	}
 }
 
+func TestStreamUnauthorizedIsAuth(t *testing.T) {
+	// A revoked subscription resets only its stream.
+	err := ffi.NewMoqErrorProtocol(ffi.MoqProtocolError{
+		Scope: moq.ErrorScopeStream, Code: 0x3B, Kind: moq.ProtocolKindUnauthorized, Message: "revoked",
+	})
+	if !moq.IsAuthError(err) {
+		t.Fatalf("a stream-scoped Unauthorized is not an auth error: %v", err)
+	}
+}
+
 func TestSessionLimitProtocolKind(t *testing.T) {
 	err := ffi.NewMoqErrorProtocol(ffi.MoqProtocolError{
 		Scope: moq.ErrorScopeSession, Code: 7, Kind: moq.ProtocolKindTooManyRequests, Message: "request limit",

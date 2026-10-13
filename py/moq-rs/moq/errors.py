@@ -38,7 +38,8 @@ def is_shutdown(err: BaseException) -> bool:
 
 
 def is_auth(err: BaseException) -> bool:
-    """True for HTTP 401/403 and a protocol Unauthorized session close.
+    """True for HTTP 401/403 and a protocol Unauthorized, whether a session close
+    or a stream reset (a revoked subscription, its session still up).
 
     Unlike a transport failure, retrying without new credentials won't help, so
     callers should surface these rather than reconnect.

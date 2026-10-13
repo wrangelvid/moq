@@ -27,6 +27,13 @@ final class SmokeTests: XCTestCase {
         }
     }
 
+    /// A revoked subscription resets only its stream, and is still an auth failure.
+    func testStreamUnauthorizedIsAuth() {
+        let details = ProtocolError(scope: .stream, code: 0x3B, kind: .unauthorized, message: "revoked")
+        let error: MoqError = .Protocol(details: details)
+        XCTAssertTrue(error.isAuth)
+    }
+
     /// An error's description is the Rust error message.
     func testErrorDescriptionIsRustMessage() {
         XCTAssertEqual(MoqError.Closed.description, "closed")

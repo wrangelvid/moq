@@ -35,7 +35,7 @@ import { ObjectDatagram } from "./datagram.ts";
 import { requestReason, toRequestCode } from "./error.ts";
 import { decodeObjectTime, Frame, type Group as GroupMessage, hasFirstObjectBit, ObjectIdGap } from "./object.ts";
 import { fromWire, toWire } from "./priority.ts";
-import { type Publish, PublishDone, PublishError, publishDoneClean } from "./publish.ts";
+import { type Publish, PublishDone, PublishDoneStatus, PublishError, publishDoneClean } from "./publish.ts";
 import {
 	type PublishNamespace,
 	PublishNamespaceDone,
@@ -759,7 +759,7 @@ export class Subscriber {
 			// unsubscribe, a revoked grant); race them once so the demand loop doesn't
 			// re-subscribe each pass.
 			const done = race([
-				this.#runPublishDone(stream, subscription).then(() => publisherEnded),
+				this.#runPublishDone(stream, subscription, refused).then(() => publisherEnded),
 				producer.closed.then(() => localEnded),
 				revoked,
 			]);
@@ -811,13 +811,14 @@ export class Subscriber {
 	/**
 	 * Read the PUBLISH_DONE that ends a subscription, then wait for the data streams it counts.
 	 *
-	 * An error status aborts the track with it. A clean one leaves streams in flight, since
+	 * An error status aborts the track with it, and UNAUTHORIZED with `refused`, the error a
+	 * local revocation raises. A clean one leaves streams in flight, since
 	 * QUIC does not order them, so wait until the Stream Count many have been read, or a
 	 * bounded grace for the ones that never arrive (the draft says to use a timeout). The count
 	 * is only a hint: a peer may send 0 regardless, so 0 waits out the grace. A request
 	 * stream that FINs without PUBLISH_DONE is a protocol violation.
 	 */
-	async #runPublishDone(stream: Stream, subscription: Subscription): Promise<void> {
+	async #runPublishDone(stream: Stream, subscription: Subscription, refused: Error): Promise<void> {
 		const version = this.#session.version;
 		if (await stream.reader.done()) throw new ProtocolViolation("subscribe stream ended without PUBLISH_DONE");
 		const typeId = await stream.reader.u53();
@@ -825,6 +826,7 @@ export class Subscriber {
 			throw new ProtocolViolation(`unexpected message on a subscription: 0x${typeId.toString(16)}`);
 		}
 		const done = await PublishDone.decode(stream.reader, version);
+		if (done.statusCode === PublishDoneStatus.UNAUTHORIZED) throw refused;
 		if (!publishDoneClean(done.statusCode, version)) {
 			throw new Error(`publish done: status=0x${done.statusCode.toString(16)} reason=${done.reasonPhrase}`);
 		}

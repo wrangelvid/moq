@@ -15,7 +15,10 @@ import dev.moq.json.StreamConfig
 import dev.moq.json.update
 import dev.moq.json.valuesAs
 import kotlinx.serialization.Serializable
+import uniffi.moq.MoqErrorScope
 import uniffi.moq.MoqException
+import uniffi.moq.MoqProtocolError
+import uniffi.moq.MoqProtocolKind
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -54,6 +57,18 @@ class SmokeTest {
     fun `diagnostic errors expose their named reason`() {
         val error = MoqException.Transport(reason = "reset")
         assertEquals("reset", error.reason)
+    }
+
+    /** A revoked subscription resets only its stream, and is still an auth failure. */
+    @Test
+    fun `a stream unauthorized is an auth error`() {
+        val details = MoqProtocolError(
+            scope = MoqErrorScope.STREAM,
+            code = 0x3Bu,
+            kind = MoqProtocolKind.UNAUTHORIZED,
+            message = "revoked",
+        )
+        assertTrue(MoqException.Protocol(details).isAuth)
     }
 
     @Test

@@ -151,6 +151,30 @@ async fn closing_a_broadcast_relays_its_tracks_own_end() {
 	}
 }
 
+/// A revocation bridged from moq-lite reaches a moq-transport subscriber as
+/// UNAUTHORIZED, not as an internal error.
+#[moq_net_sim::test]
+async fn a_bridged_revocation_reaches_ietf_as_unauthorized() {
+	for version in ["moq-transport-14", "moq-transport-17", "moq-transport-22"] {
+		let chain = Chain::new("moq-lite-06", version, Duration::ZERO).await;
+		let broadcast = chain.publisher.create_broadcast("bcast").unwrap();
+		let mut track = broadcast.create_track("video", timed()).unwrap();
+		broadcast.announce(Default::default()).unwrap();
+
+		let remote = chain.resolve("bcast").await;
+		let mut sub = subscribe_delivered(&remote, &mut track, "video").await;
+
+		track.clone().abort(Error::Unauthorized).unwrap();
+
+		let err = moq_net_sim::timeout(TIMEOUT, sub.recv_group())
+			.await
+			.unwrap_or_else(|_| panic!("{version}: the track never ended"))
+			.err()
+			.unwrap_or_else(|| panic!("{version}: the track ended cleanly"));
+		assert!(matches!(err, Error::Unauthorized), "{version}: ended with {err:?}");
+	}
+}
+
 /// A subscribe sent while the route is being withdrawn, at every point the withdrawal
 /// can be on either hop, ends `Unroutable`.
 #[moq_net_sim::test]

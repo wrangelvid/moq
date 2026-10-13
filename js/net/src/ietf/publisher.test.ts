@@ -3,7 +3,7 @@ import { Signal } from "@moq/signals";
 import type { Grant } from "../auth.ts";
 import type { Producer as BroadcastProducer } from "../broadcast.ts";
 import * as Epoch from "../epoch.ts";
-import { error } from "../error.ts";
+import { error, unauthorized } from "../error.ts";
 import { Producer as GroupProducer, MAX_GROUP_FRAMES } from "../group.ts";
 import { type Hop, HopSchema } from "../hop.ts";
 import { createMockTransportPair } from "../mock.ts";
@@ -1530,8 +1530,14 @@ test("subscription completion sends PUBLISH_DONE on every supported draft", asyn
 		Version.DRAFT_19,
 	] as const;
 
+	// A revocation bridged from moq-lite says UNAUTHORIZED, any other failure INTERNAL_ERROR.
+	const ends = [
+		[undefined, 0x2],
+		[new Error("failed"), 0x0],
+		[unauthorized("test"), 0x1],
+	] as const;
 	for (const version of versions) {
-		for (const abort of [undefined, new Error("failed")]) {
+		for (const [abort, status] of ends) {
 			const pair = createMockTransportPair(ALPN.DRAFT_19);
 			const session = new NativeSession(pair.server, version, true);
 			const path = Path.from("test");
@@ -1556,7 +1562,7 @@ test("subscription completion sends PUBLISH_DONE on every supported draft", asyn
 			expect(await client.reader.u53()).toBe(PublishDone.id);
 			const done = await PublishDone.decode(client.reader, version);
 			expect(done.requestId).toBe(version <= Version.DRAFT_16 ? requestId : undefined);
-			expect(done.statusCode).toBe(abort ? 0x0 : 0x2);
+			expect(done.statusCode).toBe(status);
 
 			await running;
 			client.close();
@@ -1564,6 +1570,35 @@ test("subscription completion sends PUBLISH_DONE on every supported draft", asyn
 			origin.close();
 		}
 	}
+});
+
+test("a route revoked upstream refuses a subscription as UNAUTHORIZED", async () => {
+	const pair = createMockTransportPair(ALPN.DRAFT_19);
+	const { pub, origin } = publisher(pair.server);
+	const path = Path.from("test");
+	const route = origin.dynamic(path);
+	const requested = route.requested();
+
+	const client = await Stream.open(pair.client, { version: VERSION });
+	const server = await Stream.accept(pair.server, VERSION);
+	if (!server) throw new Error("publisher never accepted the subscribe stream");
+	const running = pub.runSubscribe(
+		new Subscribe({ requestId: 7n, trackNamespace: path, trackName: "video", subscriberPriority: 0 }),
+		server,
+	);
+
+	const pending = (await requested.next()).value;
+	if (!pending) throw new Error("the route was never asked");
+	pending.reject(unauthorized("test"));
+
+	expect(await client.reader.u53()).toBe(RequestError.id);
+	const refusal = await RequestError.decode(client.reader, VERSION);
+	expect(refusal.errorCode).toBe(toRequestCode("unauthorized", "subscribe", VERSION));
+
+	await running;
+	client.close();
+	route.close();
+	origin.close();
 });
 
 // The adapter delivers a draft-14 to -16 update to its subscription's stream. Left unread, it

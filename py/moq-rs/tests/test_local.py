@@ -124,6 +124,8 @@ def test_protocol_error_helper_covers_known_app_and_unknown():
         (moq.ErrorScope.SESSION, 64 + 404, moq.ProtocolKind.APP, False),
         (moq.ErrorScope.SESSION, 0x1F, moq.ProtocolKind.UNKNOWN, False),
         (moq.ErrorScope.STREAM, 64 + 7, moq.ProtocolKind.APP, False),
+        # A revoked subscription resets only its stream.
+        (moq.ErrorScope.STREAM, 0x3B, moq.ProtocolKind.UNAUTHORIZED, True),
     ]
     for scope, code, kind, auth in cases:
         details = moq.ProtocolError(scope=scope, code=code, kind=kind, message="x")
