@@ -629,9 +629,10 @@ impl Reader {
 				Some(None) => {}
 			},
 			// No front is left to replace the copy: the track ends as it does. A copy whose
-			// session closed locally ends it cleanly.
+			// session closed locally ends it cleanly, and without one the front was
+			// cancelled with its origin.
 			Some(None) => match serving.map(&done) {
-				None => return Some(Poll::Ready(Err(Error::Dropped))),
+				None => return Some(Poll::Ready(Err(Error::Cancel))),
 				Some(Some(Ok(()) | Err(Error::Closed))) => return Some(Poll::Ready(Ok(None))),
 				Some(Some(Err(err))) => return Some(Poll::Ready(Err(err))),
 				Some(None) => {}
@@ -716,7 +717,7 @@ impl Reader {
 				_ => {}
 			}
 		} else if concluded.is_some() {
-			return Poll::Ready(Err(Error::Dropped));
+			return Poll::Ready(Err(Error::Cancel));
 		}
 		let _ = self.route.poll_changed(serving.unwrap_or_default(), waiter);
 		Poll::Pending
@@ -1740,6 +1741,21 @@ mod test {
 		assert!(matches!(
 			reading.read_frame().now_or_never(),
 			Some(Err(Error::Unroutable))
+		));
+	}
+
+	/// A front cancelled with its origin while the track had no copy leaves its reader
+	/// nothing to follow: the read ends cancelled, not `Dropped`.
+	#[test]
+	fn a_cancelled_front_ends_a_track_without_a_copy() {
+		let routes = Producer::new();
+		let logical = logical(&routes);
+		let mut sub = subscribe(&logical, Duration::ZERO);
+		drop(routes);
+		assert!(matches!(sub.recv_group().now_or_never(), Some(Err(Error::Cancel))));
+		assert!(matches!(
+			sub.poll_finished(&kio::Waiter::noop()),
+			Poll::Ready(Err(Error::Cancel))
 		));
 	}
 

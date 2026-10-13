@@ -603,7 +603,23 @@ impl From<&Error> for SessionError {
 			// (a session 0x4 would become the stream's GOING_AWAY), and the draft already
 			// says an unrecognized code is an unspecified error. Send that instead.
 			Error::Remote(_) => Self::Internal,
-			_ => Self::Internal,
+			// Nothing session-scoped to say: a stream condition (see above), a dropped
+			// producer, or a transport that failed under us.
+			Error::Transport(_)
+			| Error::Old
+			| Error::NotFound
+			| Error::NotFetchable
+			| Error::InvalidJoiningRequestId
+			| Error::InvalidRange
+			| Error::Unroutable
+			| Error::Dropped
+			| Error::Lagged
+			| Error::FrameTooLarge
+			| Error::GroupTooLarge
+			| Error::FrameOpen
+			| Error::TimestampMismatch
+			| Error::Evicted
+			| Error::MalformedTrack => Self::Internal,
 		}
 	}
 }
@@ -618,8 +634,10 @@ impl From<&Error> for StreamError {
 			Error::Stream(err) => err.clone(),
 			// App codes share the 64+ range in both registries.
 			Error::Session(SessionError::App(app)) => Self::App(*app),
-			// A session-scoped code has no meaning in this registry; don't forward the number.
-			Error::Session(_) => Self::Internal,
+			// Another session died under this stream, say the upstream one: the peer's own
+			// session is fine and only the path lost its route. The session code has no
+			// meaning in this registry, so the number is not forwarded either.
+			Error::Session(_) | Error::Transport(_) => Self::Unroutable,
 			Error::Cancel | Error::Closed => Self::Cancel,
 			Error::SessionClosed => Self::Session(SessionError::Cancel),
 			Error::Decode(coding::DecodeError::Session(err)) => Self::Session(err.clone()),
@@ -652,10 +670,18 @@ impl From<&Error> for StreamError {
 			Error::Version
 			| Error::UnknownAlpn(_)
 			| Error::TooManyParameters
+			| Error::TooManyRequests
+			| Error::Duplicate
 			| Error::GoawayTimeout
 			| Error::ProtocolViolation
 			| Error::UnexpectedMessage => Self::Session(SessionError::from(err)),
-			_ => Self::Internal,
+			// Refused on this stream alone, with no stream code that says why.
+			Error::Unsupported | Error::InvalidRange | Error::InvalidJoiningRequestId => Self::Internal,
+			// Our own failure: a message we could not encode or a write the API refused.
+			Error::Encode(_) | Error::FrameOpen => Self::Internal,
+			// A producer dropped without an end, which a correct one never does: a bug on
+			// this side, so the peer reads an unspecified error.
+			Error::Dropped => Self::Internal,
 		}
 	}
 }
@@ -827,17 +853,29 @@ mod tests {
 			64 + 7
 		);
 
-		// An unregistered code carries no registry, so it must not be re-sent as a number
-		// that means something here: session 0x4 and 0x5 are GOING_AWAY and TOO_FAR_BEHIND
-		// on a stream. Downgrade to the unspecified-error code instead.
-		for code in [0x4, 0x5, 0x1f] {
+		// A session code must not be re-sent as a number that means something here: session
+		// 0x4 and 0x5 are GOING_AWAY and TOO_FAR_BEHIND on a stream. Another session dying
+		// under a stream, or its transport, only cost the stream its route.
+		for code in [0x1, 0x4, 0x5, 0x1f] {
 			let crossed = StreamError::from(&Error::from(SessionError::from_code(code)));
 			assert_eq!(
 				crossed,
-				StreamError::Internal,
+				StreamError::Unroutable,
 				"session {code:#x} leaked into the stream space"
 			);
 		}
+		assert_eq!(
+			StreamError::from(&Error::Transport("timed out".into())),
+			StreamError::Unroutable
+		);
+	}
+
+	// A dropped producer is a bug, never a condition with its own code, so it stays the
+	// unspecified error in both registries.
+	#[test]
+	fn dropped_is_internal() {
+		assert_eq!(StreamError::from(&Error::Dropped), StreamError::Internal);
+		assert_eq!(SessionError::from(&Error::Dropped), SessionError::Internal);
 	}
 
 	// The registry a code is read with depends on what failed, and picking the wrong one

@@ -437,6 +437,8 @@ struct ConnectionState {
 	/// Set once by whichever side closes first.
 	/// Setting it wakes both sides.
 	close_state: kio::Shared<Option<(u32, String)>>,
+	/// The connection died without a close code, so nobody reads one off it.
+	timed_out: AtomicBool,
 	/// One-way delay for stream data and STOP_SENDING in each direction. Zero by default.
 	latency: Mutex<Duration>,
 }
@@ -448,10 +450,17 @@ impl ConnectionState {
 
 	/// The close every stream and accept fails with, once the connection closed.
 	fn error(&self) -> Option<MockError> {
-		self.close_state
-			.read()
-			.as_ref()
-			.map(|(code, reason)| MockError::session(*code, reason.clone()))
+		let state = self.close_state.read();
+		// Set before the close it qualifies, under the same lock.
+		let timed_out = self.timed_out.load(Ordering::Acquire);
+		state.as_ref().map(|(code, reason)| match timed_out {
+			true => MockError {
+				session: None,
+				stream: None,
+				reason: reason.clone(),
+			},
+			false => MockError::session(*code, reason.clone()),
+		})
 	}
 }
 
@@ -647,9 +656,10 @@ impl poll::Session for MockSession {
 	}
 
 	fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Self::Error> {
-		let state = std::task::ready!(self.side.conn.close_state.poll(self.closed.hold(cx), is_set));
-		let (code, reason) = state.clone().expect("set");
-		Poll::Ready(MockError::session(code, reason))
+		drop(std::task::ready!(
+			self.side.conn.close_state.poll(self.closed.hold(cx), is_set)
+		));
+		Poll::Ready(self.side.conn.error().expect("closed"))
 	}
 
 	fn stats(&self) -> impl moq_net::transport::Stats {
@@ -798,6 +808,16 @@ impl MockSession {
 	/// through it without sleeping.
 	pub fn set_latency(&self, latency: Duration) {
 		*self.side.conn.latency.lock().unwrap() = latency;
+	}
+
+	/// Kill the connection the way an idle timeout does: no close code, so both sides
+	/// fail with a transport error rather than a session one.
+	pub fn time_out(&self) {
+		let mut state = self.side.conn.close_state.lock();
+		if state.is_none() {
+			self.side.conn.timed_out.store(true, Ordering::Release);
+			*state = Some((0, "idle timeout".to_string()));
+		}
 	}
 }
 
