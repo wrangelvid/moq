@@ -12,7 +12,8 @@ export const Version = {
 	/// Also adds frame-precise subscribe/fetch bounds and a GROUP frame offset.
 	DRAFT_06: 0xff0dad06,
 	/// Work-in-progress lite-07, only negotiated when explicitly offered.
-	/// Adds the ANNOUNCE_REQUEST hidden opt-in, the publisher epoch, and the Auth Stream.
+	/// Adds the ANNOUNCE_REQUEST hidden opt-in, the publisher epoch, the Auth Stream, and
+	/// untimed tracks, whose frames and datagrams carry no timestamp.
 	DRAFT_07: 0xff0dad07,
 } as const;
 
@@ -52,7 +53,7 @@ export function hasSetupStream(version: Version): boolean {
 }
 
 /// Whether the session may deliver groups over unreliable QUIC datagrams (lite-05 §6.4).
-/// A datagram carries one single-frame group's `subscribe | sequence | timestamp | payload` and is
+/// A datagram carries one single-frame group's `subscribe | sequence | [timestamp] | payload` and is
 /// routed over the existing subscription. Added in lite-05; older versions never send/accept them.
 export function hasDatagrams(version: Version): boolean {
 	// Explicitly list older versions so future versions default to having datagrams.

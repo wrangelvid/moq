@@ -147,15 +147,22 @@ fn lite_varint_interop() {
 		.encode_bytes(version)
 		.unwrap();
 
-		// The body doesn't say it is untimed; the subscription's track does.
-		let untimed_datagram = lite::Datagram {
-			subscribe: 9,
-			sequence: 1 << 30,
-			timestamp: None,
-			payload: bytes::Bytes::from_static(b"untimed"),
-		}
-		.encode_bytes(version)
-		.unwrap();
+		// Only lite-07 can carry an untimed track's payloads; lite-06 stamps them instead. The
+		// body doesn't say it is untimed; the subscription's track does.
+		let untimed = version == lite::Version::Lite07;
+		let untimed_datagram = if untimed {
+			lite::Datagram {
+				subscribe: 9,
+				sequence: 1 << 30,
+				timestamp: None,
+				payload: bytes::Bytes::from_static(b"untimed"),
+			}
+			.encode_bytes(version)
+			.unwrap()
+			.to_vec()
+		} else {
+			Vec::new()
+		};
 
 		// An untimed track: zero on lite-07, milliseconds before it.
 		let track_info = lite::TrackInfo {
@@ -176,7 +183,11 @@ fn lite_varint_interop() {
 			],
 		);
 		// Small, since the whole input rides in one argument.
-		let untimed_group = lite_group(version, [(None, 10), (None, 300)]);
+		let untimed_group = if untimed {
+			lite_group(version, [(None, 10), (None, 300)])
+		} else {
+			Vec::new()
+		};
 
 		let input = serde_json::json!({
 			"version": crate::Version::from(version).alpn(),
@@ -184,7 +195,7 @@ fn lite_varint_interop() {
 			"varints": varints,
 			"setup": setup.to_vec(),
 			"datagram": datagram.to_vec(),
-			"untimedDatagram": untimed_datagram.to_vec(),
+			"untimedDatagram": untimed_datagram,
 			"trackInfo": track_info.to_vec(),
 			"group": group,
 			"untimedGroup": untimed_group,

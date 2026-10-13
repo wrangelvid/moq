@@ -48,4 +48,6 @@ test("an untimed datagram body carries no timestamp", async () => {
 	expect(decoded.sequence).toBe(2);
 	expect(decoded.timestamp).toBeUndefined();
 	expect(dec.decode(decoded.payload)).toBe("world");
+
+	for (const version of [Version.DRAFT_05, Version.DRAFT_06]) expect(() => dg.encode(version)).toThrow();
 });

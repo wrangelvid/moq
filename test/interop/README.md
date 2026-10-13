@@ -345,10 +345,12 @@ refusal retains its meaning and both bindings emit the same bytes.
 
 `lite_varint_interop` runs next to it and does the same through moq-lite's
 version dispatch: `lite-varint.ts` decodes Rust's lite-06 (QUIC) and lite-07
-(leading-ones) varints, a SETUP carrying a 62-bit Hop ID, a datagram, and a
-GROUP stream with frames, and re-encodes them byte for byte. Past 2^62-1 the
-range is per version: JS writes lite-07's 64-bit values, which Rust reads back,
-and JS refuses them on lite-06.
+(leading-ones) varints, a SETUP carrying a 62-bit Hop ID, a datagram, an
+untimed track's TRACK\_INFO, and a GROUP stream with frames, and re-encodes them
+byte for byte. On lite-07 it does the same for an untimed datagram and GROUP
+stream, which carry no timestamp; on lite-06 both sides refuse to write an
+untimed datagram. Past 2^62-1 the range is per version: JS writes lite-07's
+64-bit values, which Rust reads back, and JS refuses them on lite-06.
 
 `ietf_datagram_interop` does the same for moq-transport's `OBJECT_DATAGRAM` on
 drafts 14 through 22: `ietf-datagram.ts` decodes Rust's datagrams and their

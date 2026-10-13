@@ -73,8 +73,8 @@ function unzigzag(v: bigint): bigint {
  * A synchronous decode for one frame of a group or FETCH response stream.
  *
  * A non-zero `scale` means every frame is prefixed with a zigzag-delta timestamp (the lite-05
- * FRAME format), decoded into a Timestamp at that scale. Scale 0 (pre-lite-05) carries no
- * timestamp, so frames arrive untimed.
+ * FRAME format), decoded into a Timestamp at that scale. Scale 0 (pre-lite-05, or an untimed
+ * track on lite-07) carries no timestamp, so frames arrive untimed.
  */
 export function frameDecoder(scale: number): (c: Cursor) => netGroup.Frame {
 	if (scale === 0) {

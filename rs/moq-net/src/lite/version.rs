@@ -21,9 +21,11 @@ pub enum Version {
 	/// a `.`-prefixed segment below the requested prefix is left out. SUBSCRIBE_END
 	/// carries the number of group streams opened, replacing SUBSCRIBE_DROP.
 	/// ANNOUNCE_START and ANNOUNCE_UPDATE may copy a path head or hop-chain tail from a
-	/// live announcement on the same stream. Adds the Auth Stream. The wire format is
-	/// still work-in-progress, so it is advertised over ALPN as `moq-lite-07-wip` and
-	/// only when explicitly requested; the default version sets leave it out.
+	/// live announcement on the same stream. Adds the Auth Stream. An untimed track
+	/// declares a zero timescale, and its frames and datagrams carry no timestamp. The
+	/// wire format is still work-in-progress, so it is advertised over ALPN as
+	/// `moq-lite-07-wip` and only when explicitly requested; the default version sets
+	/// leave it out.
 	Lite07,
 }
 
@@ -55,7 +57,7 @@ impl Version {
 	/// layout changes.
 	///
 	/// This is the common feature boundary for TRACK_INFO, FETCH streams,
-	/// SUBSCRIBE_START/END, and per-frame timestamp prefixes.
+	/// SUBSCRIBE_START/END, and per-frame timestamp prefixes (see [`Self::wire_timescale`]).
 	#[allow(clippy::match_like_matches_macro)]
 	pub fn has_track_stream(self) -> bool {
 		// Match form so future versions default forward (AGENTS.md convention).
@@ -90,7 +92,7 @@ impl Version {
 	}
 
 	/// Whether the session may deliver groups over unreliable QUIC datagrams (lite-05 §6.4).
-	/// A datagram carries one single-frame group's `subscribe | sequence | timestamp | payload`
+	/// A datagram carries one single-frame group's `subscribe | sequence | [timestamp] | payload`
 	/// and is routed over the existing subscription. Added in lite-05; older versions never
 	/// send or accept datagram bodies.
 	#[allow(clippy::match_like_matches_macro)]

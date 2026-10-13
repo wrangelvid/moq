@@ -1001,7 +1001,7 @@ impl<S: crate::transport::poll::Session> GroupRecv<S> {
 /// format shared by GROUP streams and FETCH responses.
 struct FrameIngest {
 	/// `Some` decodes the lite-05 zigzag-delta timestamp prefix; `None` leaves frames
-	/// untimed (pre-lite-05).
+	/// untimed (pre-lite-05, or an untimed track on lite-07).
 	timescale: Option<Timescale>,
 	/// Previous frame's raw timestamp value (in `timescale` units), for the
 	/// zigzag-delta decode. The first frame's delta is absolute (prev = 0).
@@ -1014,8 +1014,8 @@ enum IngestPhase {
 	/// Reading the timestamp delta (skipped without a timescale). Stream end here
 	/// means the group has no more frames.
 	Timing,
-	/// Reading the frame size. Stream end here also ends the group (pre-lite-05,
-	/// where there is no timing prefix to act as the sentinel).
+	/// Reading the frame size. Stream end here also ends the group when there is
+	/// no timing prefix to act as the sentinel.
 	Size { timestamp: Option<Timestamp> },
 	/// Streaming the frame payload.
 	Payload { frame: frame::ProducerOwned },

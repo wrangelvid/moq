@@ -293,7 +293,7 @@ These land with the next breaking release, not the 2026-09-23 train.
   rendition flags.
 - **A track is timed or untimed, and nothing fills in a timestamp on
   receive.** An untimed track (no timescale) arrives untimed, except over
-  moq-lite 05 and later, which can't encode absence yet and carry a send time
+  moq-lite 05 and 06, which can't encode absence and carry a send time
   instead; see [untimed tracks](/concept/moq-lite#subscriptions). A write whose
   timedness doesn't match its track fails with `TimestampMismatch`.
   - moq-net: `track::Info.timescale` is `Option<Timescale>`, `None` for an

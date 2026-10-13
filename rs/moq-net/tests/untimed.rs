@@ -215,7 +215,13 @@ async fn an_explicit_start_holds_on_an_untimed_track() {
 /// lite-06.
 #[moq_net_sim::test]
 async fn datagrams_arrive_as_published() {
-	for version in ["moq-lite-05", "moq-lite-07-wip", "moq-transport-16", "moq-transport-20"] {
+	for version in [
+		"moq-lite-05",
+		"moq-lite-06",
+		"moq-lite-07-wip",
+		"moq-transport-16",
+		"moq-transport-20",
+	] {
 		let chain = Chain::new(&[version]).await;
 		let broadcast = chain.nodes[0].create_broadcast("room").unwrap();
 		let mut producer = broadcast.create_track("data", untimed()).unwrap();
@@ -233,7 +239,7 @@ async fn datagrams_arrive_as_published() {
 			.expect("datagram timeout")
 			.unwrap()
 			.expect("a datagram");
-		let stamps = version == "moq-lite-05";
+		let stamps = matches!(version, "moq-lite-05" | "moq-lite-06");
 		assert_eq!(datagram.timestamp.is_some(), stamps, "{version}");
 	}
 }

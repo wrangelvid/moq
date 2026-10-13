@@ -4,7 +4,7 @@
  * @module
  */
 import { encodeVarint, Reader } from "../stream.ts";
-import type { Version } from "./version.ts";
+import { Version } from "./version.ts";
 
 /**
  * A QUIC datagram body: `subscribe (i) | sequence (i) | [timestamp (i)] | payload (b)`, with the
@@ -33,6 +33,10 @@ export class Datagram {
 
 	/** Encode the body to a single `Uint8Array` (no length prefix; the datagram boundary delimits it). */
 	encode(version: Version): Uint8Array {
+		// Lite-05/06 have no untimed encoding, so their peers would read the payload's first bytes as the timestamp.
+		if (this.timestamp === undefined && (version === Version.DRAFT_05 || version === Version.DRAFT_06)) {
+			throw new Error("an untimed datagram needs lite-07");
+		}
 		const subscribe = encodeVarint(this.subscribe, version);
 		const sequence = encodeVarint(this.sequence, version);
 		const timestamp = this.timestamp === undefined ? new Uint8Array() : encodeVarint(this.timestamp, version);

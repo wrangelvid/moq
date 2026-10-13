@@ -31,6 +31,11 @@ impl Encode<Version> for Datagram {
 		if !version.has_datagrams() {
 			return Err(EncodeError::Version);
 		}
+		// Lite05/06 have no untimed encoding, so their peers would read the payload's first
+		// bytes as the timestamp.
+		if self.timestamp.is_none() && matches!(version, Version::Lite05 | Version::Lite06) {
+			return Err(EncodeError::Version);
+		}
 
 		w.varint(self.subscribe)?;
 		w.varint(self.sequence)?;
@@ -134,6 +139,13 @@ mod test {
 		})
 		.unwrap();
 		assert_eq!(decoded, dg);
+
+		for version in [Version::Lite05, Version::Lite06] {
+			assert!(
+				matches!(dg.encode_bytes(version), Err(EncodeError::Version)),
+				"{version}"
+			);
+		}
 	}
 
 	#[test]
