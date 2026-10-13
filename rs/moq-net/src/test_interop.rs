@@ -312,3 +312,39 @@ fn lite_auth_unsupported_interop() {
 	);
 	assert!(reader.is_empty());
 }
+
+/// An expired token's refusal keeps its meaning across the Rust/JS binding boundary: the
+/// shared session code on moq-lite, and REQUEST_ERROR EXPIRED_AUTH_TOKEN on moq-transport.
+#[test]
+#[ignore = "requires Bun; run by just test interop"]
+fn auth_expired_interop() {
+	let version = lite::Version::Lite07;
+	let mut lite = Vec::new();
+	lite::AuthReply::Error(lite::AuthError {
+		code: crate::lite::error::to_session_code(&crate::SessionError::Expired).into(),
+		reason: "expired".into(),
+	})
+	.encode(&mut Encoder::new(&mut lite, version.into()), version)
+	.unwrap();
+
+	let version = ietf::Version::Draft17;
+	let mut ietf = Vec::new();
+	let mut writer = Encoder::new(&mut ietf, version.into());
+	writer.varint(<ietf::auth::AuthError as ietf::Message>::ID).unwrap();
+	// EXPIRED_AUTH_TOKEN in the REQUEST_ERROR registry AUTH_ERROR carries.
+	ietf::auth::AuthError {
+		code: 0x5,
+		reason: "expired".into(),
+	}
+	.encode(&mut writer, version)
+	.unwrap();
+
+	let echo: serde_json::Value = serde_json::from_slice(&bun(
+		"auth-expired.ts",
+		serde_json::json!({ "lite": lite, "ietf": ietf }),
+	))
+	.unwrap();
+	let echoed = |key: &str| -> Vec<u8> { serde_json::from_value(echo[key].clone()).unwrap() };
+	assert_eq!(echoed("lite"), lite, "moq-lite AUTH_ERROR differs");
+	assert_eq!(echoed("ietf"), ietf, "moq-transport AUTH_ERROR differs");
+}

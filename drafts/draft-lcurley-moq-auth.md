@@ -167,7 +167,7 @@ A namespace prefix the presenter may subscribe to and discover.
 **Expires**:
 The number of milliseconds until the grant lapses, or 0 for never.
 Expires MUST NOT exceed 2^53 - 1 milliseconds; a larger value is a PROTOCOL_VIOLATION.
-The acceptor revokes a lapsed grant with AUTH_ERROR, and the presenter uses Expires to present a replacement token in time.
+The acceptor revokes a lapsed grant, or refuses a lapsed token, with AUTH_ERROR EXPIRED_AUTH_TOKEN; the presenter uses Expires to present a replacement token in time.
 
 ## AUTH_ERROR {#auth-error}
 

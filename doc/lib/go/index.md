@@ -125,6 +125,9 @@ the simultaneous announcements or subscriptions, or ask the relay operator
 to adjust the [session limits](/bin/relay/config#session-and-peer), before
 reconnecting with the same workload.
 
+A session closed because its token expired reports the protocol kind
+`ProtocolKindExpired`. Reconnect with a fresh token; the same one is refused.
+
 ## Reference
 
 - API reference: [pkg.go.dev/moq.dev/moq](https://pkg.go.dev/moq.dev/moq)

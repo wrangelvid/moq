@@ -217,6 +217,8 @@ const (
 	ProtocolKindUnknown = ffi.MoqProtocolKindUnknown
 	// ProtocolKindTooManyRequests identifies an exceeded session request cap.
 	ProtocolKindTooManyRequests = ffi.MoqProtocolKindTooManyRequests
+	// ProtocolKindExpired identifies an expired token, which a fresh one can replace.
+	ProtocolKindExpired = ffi.MoqProtocolKindExpired
 )
 
 // AudioSampleFormat values: the raw PCM sample layout fed to or returned from the

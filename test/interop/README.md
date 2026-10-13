@@ -343,6 +343,11 @@ match byte for byte and decode back to the same value.
 NOT\_SUPPORTED across Rust and JS in both directions, checking that the later
 refusal retains its meaning and both bindings emit the same bytes.
 
+`auth_expired_interop` sends AUTH\_ERROR for an expired token on moq-lite
+(EXPIRED\_AUTH\_TOKEN, 0x18 in the session registry) and on moq-transport
+(EXPIRED\_AUTH\_TOKEN, 0x5 in REQUEST\_ERROR), checking that JS reads both as
+`SessionCode.Expired` and writes the same bytes back.
+
 `lite_varint_interop` runs next to it and does the same through moq-lite's
 version dispatch: `lite-varint.ts` decodes Rust's lite-06 (QUIC) and lite-07
 (leading-ones) varints, a SETUP carrying a 62-bit Hop ID, a datagram, and a

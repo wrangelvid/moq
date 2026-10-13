@@ -3712,6 +3712,46 @@ async fn reconnect_stops_on_a_session_level_rejection() {
 	server_handle.abort();
 }
 
+/// An expired token stops the loop too, keeping its own code: a redial would present
+/// the same token and come back UNAUTHORIZED, hiding that a fresh one is the fix.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn reconnect_stops_on_an_expired_session() {
+	use std::sync::Arc;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	let (mut server, addr) = test_server().await;
+	let url: url::Url = format!("https://localhost:{}", addr.port()).parse().unwrap();
+
+	let accepts = Arc::new(AtomicUsize::new(0));
+	let server_accepts = accepts.clone();
+	let server_handle = tokio::spawn(async move {
+		while let Some(request) = server.accept().await {
+			server_accepts.fetch_add(1, Ordering::SeqCst);
+			let session = request.ok().await?;
+			session.abort(moq_net::SessionError::Expired.into());
+		}
+		Ok::<_, anyhow::Error>(())
+	});
+
+	let connection = test_client().connect(url);
+	let err = tokio::time::timeout(TIMEOUT, connection.closed())
+		.await
+		.expect("an expired session must stop the reconnect loop promptly")
+		.expect_err("an expired session must surface as an error");
+	assert!(
+		matches!(
+			err,
+			moq_tokio::Error::MoqNet(moq_net::Error::Session(moq_net::SessionError::Expired))
+		),
+		"unexpected error: {err}"
+	);
+	assert!(err.is_auth());
+	assert_eq!(accepts.load(Ordering::SeqCst), 1, "the loop redialed the expired token");
+
+	server_handle.abort();
+}
+
 /// One-shot mode is the other way a caller observes the rejection: with no
 /// reconnect loop in the way, the session's close is the terminal error.
 #[tracing_test::traced_test]

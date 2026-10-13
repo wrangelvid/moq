@@ -1212,8 +1212,20 @@ async fn a_fixed_lease_still_expires() {
 			_ => spawn_ws_relay(auth).await,
 		};
 		let (pub_session, sub_session) = connect_and_round_trip(&room_url(scheme, port)).await;
-		assert_closed(pub_session, Duration::from_secs(5), &format!("{scheme} publisher")).await;
-		assert_closed(sub_session, Duration::from_secs(5), &format!("{scheme} subscriber")).await;
+		for (session, role) in [(pub_session, "publisher"), (sub_session, "subscriber")] {
+			let closed = tokio::time::timeout(Duration::from_secs(5), session.closed())
+				.await
+				.unwrap_or_else(|_| panic!("relay should close the {scheme} {role} session"));
+			assert!(
+				matches!(
+					closed,
+					Err(moq_tokio::Error::MoqNet(moq_net::Error::Session(
+						moq_net::SessionError::Expired
+					)))
+				),
+				"{scheme} {role}: {closed:?}"
+			);
+		}
 		relay.abort();
 	}
 }
@@ -1299,9 +1311,14 @@ async fn an_outage_keeps_the_session_until_expires() {
 			.is_err(),
 		"an outage must not close the session before expires"
 	);
-	tokio::time::timeout_at(latest + tolerance, client.closed())
+	let closed = tokio::time::timeout_at(latest + tolerance, client.closed())
 		.await
 		.expect("closed at expires, not later");
+	// Expired, not Unauthorized, so the client knows a fresh token is the fix.
+	assert!(
+		matches!(closed, moq_net::Error::Session(moq_net::SessionError::Expired)),
+		"{closed:?}"
+	);
 	let (reason, _) = producer.closed().await;
 	assert_eq!(reason, moq_auth::lease::Reason::Expired);
 	supervised

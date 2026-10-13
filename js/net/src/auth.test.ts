@@ -263,6 +263,42 @@ describe.each([Lite.ALPN_07_WIP, Ietf.ALPN.DRAFT_17, Ietf.ALPN.DRAFT_22])("%s", 
 		server.abort();
 	});
 
+	test("a lapsed token is refused or revoked as Expired, apart from Unauthorized", async () => {
+		const { client, server, transport } = await connect({ publish: new OriginProducer(), protocol });
+		const requests = server.auth.requests();
+		const issued: Issued[] = [];
+		const answering = (async () => {
+			for (;;) {
+				const request = await requests.next();
+				if (!request) break;
+				if (new TextDecoder().decode(request.token) === "stale") request.reject(SessionCode.Expired, "expired");
+				else issued.push(request.accept(grant(["a"], [])));
+			}
+		})();
+		try {
+			const refused = await client.auth.add("stale").catch((e: unknown) => e);
+			expect(refused).toBeInstanceOf(SessionError);
+			expect((refused as SessionError).code).toBe(SessionCode.Expired);
+
+			const token = await client.auth.add("renewal");
+			issued[issued.length - 1]?.revoke(SessionCode.Expired, "expired");
+			const revoked = await token.closed;
+			expect(revoked).toBeInstanceOf(SessionError);
+			expect((revoked as SessionError).code).toBe(SessionCode.Expired);
+
+			let closed = false;
+			void transport.closed.then(() => {
+				closed = true;
+			});
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			expect(closed).toBe(false);
+		} finally {
+			client.abort();
+			server.abort();
+			await answering;
+		}
+	});
+
 	test("closing the session drops the grant", async () => {
 		const { client, server } = await connect({ publish: new OriginProducer(), protocol });
 		await waitFor(client.auth.grant, (g) => g !== undefined && g.publish.size > 0);

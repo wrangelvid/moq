@@ -61,6 +61,11 @@ pub enum SessionError {
 	#[error("unknown auth token alias")]
 	UnknownAuthTokenAlias,
 
+	/// The token expired. Unlike [`Unauthorized`](Self::Unauthorized), presenting a fresh
+	/// one can succeed.
+	#[error("expired auth token")]
+	Expired,
+
 	/// An application-chosen code, offset into the 64+ range on the wire.
 	#[error("app code={0}")]
 	App(u16),
@@ -94,6 +99,7 @@ impl SessionError {
 			Self::AuthTokenCacheOverflow => 0x13,
 			Self::Version => 0x15,
 			Self::UnknownAuthTokenAlias => 0x17,
+			Self::Expired => 0x18,
 			Self::Unsupported => 0x1,
 			Self::App(app) => *app as u32 + 64,
 			Self::Unknown(code) => *code,
@@ -119,6 +125,7 @@ impl SessionError {
 			0x13 => Self::AuthTokenCacheOverflow,
 			0x15 => Self::Version,
 			0x17 => Self::UnknownAuthTokenAlias,
+			0x18 => Self::Expired,
 			code @ 64.. => match u16::try_from(code - 64) {
 				Ok(app) => Self::App(app),
 				Err(_) => Self::Unknown(code),
@@ -697,6 +704,7 @@ mod tests {
 			SessionError::AuthTokenCacheOverflow,
 			SessionError::Version,
 			SessionError::UnknownAuthTokenAlias,
+			SessionError::Expired,
 			SessionError::App(0),
 			SessionError::App(404),
 		];
@@ -716,6 +724,7 @@ mod tests {
 		assert_eq!(SessionError::AuthTokenCacheOverflow.to_code(), 0x13);
 		assert_eq!(SessionError::Version.to_code(), 0x15);
 		assert_eq!(SessionError::UnknownAuthTokenAlias.to_code(), 0x17);
+		assert_eq!(SessionError::Expired.to_code(), 0x18);
 
 		// The reserved 32-47 range, and anything else unregistered, keeps its value instead
 		// of being given a meaning. A peer on the old placeholders (0x20-0x22) lands here.

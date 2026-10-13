@@ -42,9 +42,10 @@ export function intoSetup(params: SetupOptions, version: IetfVersion) {
 	if (supported(version)) params.setVarint(SetupOption.Auth, 1n);
 }
 
-/** The REQUEST_ERROR codes AUTH_ERROR carries. */
+/** The REQUEST_ERROR codes AUTH_ERROR carries, the same from draft-15 on. */
 const UNAUTHORIZED = 0x1;
 const NOT_SUPPORTED = 0x3;
+const EXPIRED_AUTH_TOKEN = 0x5;
 
 /** Longest AUTH_ERROR reason, in bytes, matching the Rust decoder. */
 const MAX_REASON = 8192;
@@ -208,6 +209,7 @@ export class AuthError {
 	/** What the refusal means to the presenter: NOT_SUPPORTED is a grant it could not tell. */
 	toError(): Error {
 		if (this.code === NOT_SUPPORTED) return new Unsupported(this.reason);
+		if (this.code === EXPIRED_AUTH_TOKEN) return new SessionError(SessionCode.Expired, { reason: this.reason });
 		return new SessionError(SessionCode.Unauthorized, { reason: this.reason });
 	}
 }
@@ -259,8 +261,10 @@ export class IetfAuthWire implements AuthWire {
 	}
 
 	async refuse(stream: Stream, code: SessionCode, reason: string): Promise<void> {
-		// The public API speaks session codes; this registry distinguishes only unsupported from unauthorized.
-		const wire = code === SessionCode.Version || code === SessionCode.Unsupported ? NOT_SUPPORTED : UNAUTHORIZED;
+		// The public API speaks session codes; this registry distinguishes only unsupported, expired, and unauthorized.
+		let wire = UNAUTHORIZED;
+		if (code === SessionCode.Version || code === SessionCode.Unsupported) wire = NOT_SUPPORTED;
+		else if (code === SessionCode.Expired) wire = EXPIRED_AUTH_TOKEN;
 		await new AuthError(wire, reason).encode(stream.writer, this.#version);
 	}
 

@@ -271,8 +271,10 @@ impl Error {
 	pub fn connect_error(&self) -> Option<crate::ConnectError> {
 		match self {
 			Self::Connect(err) => Some(*err),
+			// A lapsed token is refused like any other credential: a redial presents it again.
 			Self::MoqNet(
-				moq_net::Error::Unauthorized | moq_net::Error::Session(moq_net::SessionError::Unauthorized),
+				moq_net::Error::Unauthorized
+				| moq_net::Error::Session(moq_net::SessionError::Unauthorized | moq_net::SessionError::Expired),
 			) => Some(crate::ConnectError::Unauthorized),
 			#[cfg(feature = "noq")]
 			Self::Noq(err) => err.connect_error(),

@@ -106,6 +106,8 @@ pub enum moq_protocol_kind {
 	MOQ_PROTOCOL_KIND_UNKNOWN = 24,
 	/// The session exceeded its announcement or subscription cap.
 	MOQ_PROTOCOL_KIND_TOO_MANY_REQUESTS = 25,
+	/// The token expired; present a fresh one rather than retrying it.
+	MOQ_PROTOCOL_KIND_EXPIRED = 26,
 }
 
 /// A protocol failure a peer sent: scope, verbatim wire code, and recognized kind.
@@ -380,6 +382,7 @@ fn session_kind(err: &moq_net::SessionError) -> moq_protocol_kind {
 		moq_net::SessionError::Timeout => MOQ_PROTOCOL_KIND_TIMEOUT,
 		moq_net::SessionError::Version => MOQ_PROTOCOL_KIND_VERSION,
 		moq_net::SessionError::TooManyRequests => MOQ_PROTOCOL_KIND_TOO_MANY_REQUESTS,
+		moq_net::SessionError::Expired => MOQ_PROTOCOL_KIND_EXPIRED,
 		moq_net::SessionError::App(_) => MOQ_PROTOCOL_KIND_APP,
 		moq_net::SessionError::Unknown(_) => MOQ_PROTOCOL_KIND_UNKNOWN,
 		_ => MOQ_PROTOCOL_KIND_UNKNOWN,
@@ -470,5 +473,13 @@ mod tests {
 			error.kind,
 			super::moq_protocol_kind::MOQ_PROTOCOL_KIND_TOO_MANY_REQUESTS as u32
 		);
+	}
+
+	#[test]
+	fn an_expired_token_has_a_known_kind() {
+		let error = super::from_session(&moq_net::SessionError::Expired);
+		assert_eq!(error.scope, super::moq_error_scope::MOQ_ERROR_SCOPE_SESSION as u32);
+		assert_eq!(error.code, 0x18);
+		assert_eq!(error.kind, super::moq_protocol_kind::MOQ_PROTOCOL_KIND_EXPIRED as u32);
 	}
 }

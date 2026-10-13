@@ -265,7 +265,7 @@ The codes moq-lite uses are listed in full below; an endpoint MUST NOT assign a 
 
 Codes 64 and above are the application's, opaque to moq-lite.
 An endpoint MUST ignore a code it does not recognize, treating it as an unspecified error.
-An endpoint MUST NOT infer a meaning for an unregistered code; in particular, it MUST NOT assume a code is an authorization failure unless it is UNAUTHORIZED.
+An endpoint MUST NOT infer a meaning for an unregistered code; in particular, it MUST NOT assume a code is an authorization failure unless it is UNAUTHORIZED or EXPIRED_AUTH_TOKEN.
 
 Codes 32 through 47 are reserved for a future revision: nothing is assigned there and a value in it MUST NOT be interpreted.
 
@@ -300,6 +300,8 @@ Sent when terminating the session, via the transport's session close.
 |  0x15  | VERSION_NEGOTIATION_FAILED | No version could be negotiated. |
 | ------- | ------------- | ----------- |
 |  0x17  | UNKNOWN_AUTH_TOKEN_ALIAS | A token named an alias that was never registered. |
+| ------- | ------------- | ----------- |
+|  0x18  | EXPIRED_AUTH_TOKEN | The token expired. Unlike UNAUTHORIZED, a fresh token can succeed. |
 | ------- | ------------- | ----------- |
 |  0x30  | NOT_SUPPORTED | The requested feature, token, or grant is unsupported. |
 | ------- | ------------- | ----------- |
@@ -1446,7 +1448,7 @@ A [pattern](#path-pattern) matching broadcast paths the opener may subscribe to.
 **Expires**:
 The number of milliseconds until the grant lapses, or 0 for never.
 A value greater than 2^53 - 1 is invalid and MUST close the session with PROTOCOL_VIOLATION.
-The acceptor revokes a lapsed grant with AUTH_ERROR; the opener uses Expires to present a replacement token in time.
+The acceptor revokes a lapsed grant, or refuses a lapsed token, with AUTH_ERROR EXPIRED_AUTH_TOKEN; the opener uses Expires to present a replacement token in time.
 
 ### Path Pattern {#path-pattern}
 A pattern is a set of broadcast paths, written as `/`-separated segments.
@@ -1578,6 +1580,7 @@ The `Message Length` describes the payload size on the wire.
 - Capped the Message Length of every message except FRAME at 65,535 bytes.
 - Added the TOO_MANY_REQUESTS (0x7) session code, closing a session whose peer goes past the endpoint's bound on subscriptions or announcements.
 - Added the AUTH_TOKEN_CACHE_OVERFLOW (0x13) and UNKNOWN_AUTH_TOKEN_ALIAS (0x17) session codes, with moq-transport's meaning.
+- Added the EXPIRED_AUTH_TOKEN (0x18) session code, with moq-transport's meaning. An acceptor refuses or revokes a lapsed token with it.
 - Limited AUTH_OK Expires to 2^53 - 1 milliseconds, with an out-of-range value closing the session with PROTOCOL_VIOLATION.
 - Invalid UTF-8 or an oversized AUTH_ERROR reason closes the session with PROTOCOL_VIOLATION.
 - An Auth Stream message that fails to decode, has trailing body bytes, or has an unexpected type, or a second AUTH from the opener, closes the session with PROTOCOL_VIOLATION.

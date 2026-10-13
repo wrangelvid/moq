@@ -154,8 +154,8 @@ impl Refresh {
 		if request.token().is_empty() {
 			// The connection's own lease answers an empty token while it lives, even
 			// after an earlier empty-token stream was withdrawn.
-			if self.owner.closed().now_or_never().is_some() {
-				request.reject(SessionError::Unauthorized, "connection credential ended");
+			if let Some(reason) = self.owner.closed().now_or_never() {
+				request.reject(code(&reason), "connection credential ended");
 				return;
 			}
 			let unissued = self
@@ -170,6 +170,10 @@ impl Refresh {
 			// use while another credential keeps the session alive. Validate the
 			// exact snapshot that would be issued.
 			let mut credential = Credential::new(self.owner.clone());
+			if credential.expires.is_some_and(|at| at <= tokio::time::Instant::now()) {
+				request.reject(SessionError::Expired, "connection credential expired");
+				return;
+			}
 			if !self.valid(&credential.grant) {
 				request.reject(SessionError::Unauthorized, "connection credential no longer valid");
 				return;
@@ -298,7 +302,7 @@ impl Refresh {
 						Change::Grant(_) => lease::Reason::Narrowed,
 					};
 					if !withdrawn && let Some(issued) = credential.issued {
-						issued.revoke(SessionError::Unauthorized, reason.to_string());
+						issued.revoke(code(&reason), reason.to_string());
 					}
 					self.authorize();
 					if self.credentials.is_empty() {
@@ -307,6 +311,15 @@ impl Refresh {
 				}
 			}
 		}
+	}
+}
+
+/// The code that ends a credential for `reason`: a lapsed one can be renewed, so it
+/// says so rather than reading as a refusal.
+fn code(reason: &lease::Reason) -> SessionError {
+	match reason {
+		lease::Reason::Expired => SessionError::Expired,
+		_ => SessionError::Unauthorized,
 	}
 }
 
@@ -611,6 +624,62 @@ mod tests {
 			matches!(result, Err(moq_net::Error::Session(SessionError::Unauthorized))),
 			"an empty token reissued a credential the relay removed: {:?}",
 			result.map(|token| token.grant().peek())
+		);
+		assert!(!supervising.is_finished());
+		client.abort(moq_net::Error::Cancel);
+		supervising.abort();
+		let _ = supervising.await;
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_lapsed_credential_is_revoked_and_refused_as_expired() {
+		let (auth, mut admissions) = super::super::Auth::embedded("test");
+		let request = auth.request(moq_auth::Transport::Quic, "/room");
+		let (owner, consumer) = lease::Producer::new(grant("a/**", 3000));
+		let (lease, ()) = tokio::join!(auth.admit(request), async {
+			admissions.next().await.unwrap().grant(consumer);
+		});
+		let (client, supervising) = sessions(lease.unwrap()).await;
+		let auth = client.auth();
+		let (renewal, ()) = tokio::join!(auth.add("renewal"), async {
+			admissions
+				.next()
+				.await
+				.unwrap()
+				.grant(lease::Consumer::fixed(grant("a/**", 3)));
+		});
+		let renewal = renewal.unwrap();
+		tokio::time::advance(Duration::from_secs(4)).await;
+		let revoked = renewal.closed().await;
+		assert!(
+			matches!(revoked, moq_net::Error::Session(SessionError::Expired)),
+			"{revoked:?}"
+		);
+
+		// A lapsed connection credential refuses an empty token the same way, whether its
+		// lease still runs or has ended, while a later renewal keeps the session up.
+		let (_renewal, ()) = tokio::join!(auth.add("renewal"), async {
+			admissions
+				.next()
+				.await
+				.unwrap()
+				.grant(lease::Consumer::fixed(grant("a/**", 3000)));
+		});
+		let mut lapsed = grant("a/**", 3000);
+		lapsed.expires = Some(SystemTime::now() - Duration::from_secs(1));
+		owner.update(lapsed);
+		let refused = auth.add("").await;
+		assert!(
+			matches!(refused, Err(moq_net::Error::Session(SessionError::Expired))),
+			"{:?}",
+			refused.map(|token| token.grant().peek())
+		);
+		owner.revoke(lease::Reason::Expired);
+		let refused = auth.add("").await;
+		assert!(
+			matches!(refused, Err(moq_net::Error::Session(SessionError::Expired))),
+			"{:?}",
+			refused.map(|token| token.grant().peek())
 		);
 		assert!(!supervising.is_finished());
 		client.abort(moq_net::Error::Cancel);

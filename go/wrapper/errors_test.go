@@ -117,3 +117,13 @@ func TestSessionLimitProtocolKind(t *testing.T) {
 		t.Fatalf("session limit lost its kind: %+v, %v", details, err)
 	}
 }
+
+func TestExpiredIsAnAuthError(t *testing.T) {
+	err := ffi.NewMoqErrorProtocol(ffi.MoqProtocolError{
+		Scope: moq.ErrorScopeSession, Code: 0x18, Kind: moq.ProtocolKindExpired, Message: "expired auth token",
+	})
+	details, ok := moq.ProtocolError(err)
+	if !ok || details.Kind != moq.ProtocolKindExpired || !moq.IsAuthError(err) {
+		t.Fatalf("expired token lost its kind: %+v, %v", details, err)
+	}
+}

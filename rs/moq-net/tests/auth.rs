@@ -58,6 +58,7 @@ cases!(
 	an_update_replaces_one_tokens_grant,
 	a_revoked_grant_withdraws_and_can_be_restored,
 	a_refused_token_reports_the_code,
+	an_expired_grant_ends_its_token_as_expired,
 	a_refused_setup_token_grants_nothing,
 	dropping_the_requests_refuses_queued_tokens,
 	a_closed_session_holds_no_grant,
@@ -571,6 +572,9 @@ async fn a_refused_token_reports_the_code(version: &'static str) {
 					false if request.token() == b"opaque".as_slice() => {
 						request.reject(SessionError::Unsupported, "unknown token format")
 					}
+					false if request.token() == b"stale".as_slice() => {
+						request.reject(SessionError::Expired, "token expired")
+					}
 					false => request.reject(SessionError::Unauthorized, "bad signature"),
 				}
 			}
@@ -580,6 +584,33 @@ async fn a_refused_token_reports_the_code(version: &'static str) {
 		assert!(matches!(err, Error::Session(SessionError::Unauthorized)), "{err:?}");
 		let err = pair.client.auth().add("opaque").await.err().expect("refused");
 		assert!(matches!(err, Error::Unsupported), "{err:?}");
+		let err = pair.client.auth().add("stale").await.err().expect("refused");
+		assert!(matches!(err, Error::Session(SessionError::Expired)), "{err:?}");
+	})
+	.await
+	.expect("timed out");
+}
+
+/// A grant revoked as expired ends its token with `Expired`, and only that token: the
+/// presenter can renew without reconnecting.
+async fn an_expired_grant_ends_its_token_as_expired(version: &'static str) {
+	within(async {
+		let mut pair = connect(Options {
+			version: Some(version),
+			client_publish: Some(produce_origin(2)),
+			server_requests: true,
+			..Default::default()
+		})
+		.await;
+		let mut issued = serve(pair.requests.take().unwrap(), |_| Some(grant(&["a"], &[])));
+		let (_, _setup) = issued.next().await.unwrap();
+		let token = pair.client.auth().add("renewal").await.expect("granted");
+		let (_, renewal) = issued.next().await.unwrap();
+
+		renewal.revoke(SessionError::Expired, "expired");
+		let err = token.closed().await;
+		assert!(matches!(err, Error::Session(SessionError::Expired)), "{err:?}");
+		assert_eq!(pair.client_transport.close_reason(), None);
 	})
 	.await
 	.expect("timed out");

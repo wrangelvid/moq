@@ -263,7 +263,10 @@ where
 			}
 			why = lease.ended() => {
 				tracing::info!(%why, "lease ended, closing session");
-				session.abort(moq_net::Error::Unauthorized);
+				session.abort(match why {
+					moq_auth::lease::Reason::Expired => moq_net::SessionError::Expired.into(),
+					_ => moq_net::Error::Unauthorized,
+				});
 				// Drive the teardown so the close reaches the peer.
 				let res = ended(driver.await);
 				lease.close(why, crate::connection::session_bytes(&session));

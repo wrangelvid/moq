@@ -406,6 +406,46 @@ test("a session rejected as unauthorized surfaces the code and stops retrying", 
 	}
 });
 
+// A redial would present the same lapsed token and come back UNAUTHORIZED, so the loop stops
+// on EXPIRED_AUTH_TOKEN too and leaves the code for the app, which renews by setting a new URL.
+test("a session closed as expired surfaces the code and stops retrying", async () => {
+	const original = globalThis.WebTransport;
+	const url = new URL("https://example.com/");
+	let attempts = 0;
+	const stub = function StubWebTransport() {
+		attempts++;
+		const pair = createMockTransportPair(Lite.ALPN_06);
+		void accept(pair.server, url).then(() => {
+			pair.server.close({ closeCode: SessionCode.Expired, reason: "expired" });
+		});
+		return pair.client;
+	};
+	globalThis.WebTransport = stub as unknown as typeof WebTransport;
+
+	const reload = new Reload({
+		enabled: true,
+		url,
+		websocket: { enabled: false },
+		// Unlimited retries prove that `error` settles only because the close is terminal.
+		delay: { initial: Time.Milli(1), multiplier: 1, max: Time.Milli(1), timeout: Time.Milli(0) },
+	});
+
+	try {
+		await waitUntil(() => reload.error.peek() !== undefined);
+		const err = reload.error.peek();
+		expect(err).toBeInstanceOf(SessionError);
+		expect((err as SessionError).code).toBe(SessionCode.Expired);
+		expect(attempts).toBe(1);
+		expect(reload.closed.peek()).toBeUndefined();
+
+		reload.url.set(new URL("https://example.com/?jwt=fresh"));
+		await waitUntil(() => attempts >= 2);
+	} finally {
+		reload.close();
+		globalThis.WebTransport = original;
+	}
+});
+
 test("an unauthorized session close during setup stops retrying", async () => {
 	const original = globalThis.WebTransport;
 	const url = new URL("https://example.com/");

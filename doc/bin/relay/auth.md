@@ -128,7 +128,10 @@ union, within its admitted root and SETUP role. A publish-only connection cannot
 become a subscriber. A replacement must retain the root, mounts, and routing
 classification. Dropping a token handle, expiry, or refusal at revalidation
 removes that token's grant: streams that lose permission reset, and other grants
-keep the connection alive. A refused new token leaves existing grants alone.
+keep the connection alive. A refused new token leaves existing grants alone. An
+expired grant is revoked, and a connection whose last grant expires is closed,
+as `EXPIRED_AUTH_TOKEN` rather than `UNAUTHORIZED`, so the client knows a fresh
+token is the fix.
 The grant reports its real expiry so the client can renew in time.
 
 The relay verifies a presented JWT through the same admission path, replacing

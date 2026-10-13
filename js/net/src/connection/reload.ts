@@ -515,17 +515,22 @@ export class Reload {
 			this.#deadline = undefined;
 		}
 
-		// An auth rejection stops this URL however long the session lived. UNAUTHORIZED is a
-		// specified code rather than one we guessed at, so this is the peer saying these
-		// credentials will never work; retrying them just burns the window. Matches
-		// moq-tokio's reconnect loop, which stops on the same close. A new URL or a
-		// disable/re-enable starts another sequence; the handle itself is not disposed.
+		// An auth rejection stops this URL however long the session lived. UNAUTHORIZED and
+		// EXPIRED_AUTH_TOKEN are specified codes rather than ones we guessed at, so this is
+		// the peer saying these credentials will not work again; retrying them just burns
+		// the window, and a retried expired token comes back UNAUTHORIZED, hiding that a
+		// fresh one is the fix. Matches moq-tokio's reconnect loop, which stops on the same
+		// closes. A new URL or a disable/re-enable starts another sequence; the handle
+		// itself is not disposed.
 		//
 		// Only a session close says that. The stream registry gives 2 to DELIVERY_TIMEOUT,
 		// so a stream reset during the SETUP exchange would otherwise suppress reconnect
 		// for good.
-		if (cause instanceof SessionError && cause.code === SessionCode.Unauthorized) {
-			console.warn("session rejected as unauthorized, not retrying");
+		if (
+			cause instanceof SessionError &&
+			(cause.code === SessionCode.Unauthorized || cause.code === SessionCode.Expired)
+		) {
+			console.warn(`session rejected, not retrying: ${cause.message}`);
 			this.#giveUp(cause);
 			return;
 		}

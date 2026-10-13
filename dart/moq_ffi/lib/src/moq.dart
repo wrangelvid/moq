@@ -4276,6 +4276,7 @@ enum MoqProtocolKind {
   app,
   unknown,
   tooManyRequests,
+  expired,
 }
 
 class FfiConverterMoqProtocolKind {
@@ -4328,6 +4329,8 @@ class FfiConverterMoqProtocolKind {
         return LiftRetVal(MoqProtocolKind.unknown, 4);
       case 23:
         return LiftRetVal(MoqProtocolKind.tooManyRequests, 4);
+      case 24:
+        return LiftRetVal(MoqProtocolKind.expired, 4);
       default:
         throw UniffiInternalError(
           UniffiInternalError.unexpectedEnumCase,

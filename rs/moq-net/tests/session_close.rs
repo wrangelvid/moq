@@ -324,3 +324,27 @@ async fn unsupported_close_is_decoded_by_the_negotiated_session_registry() {
 		assert!(matches!(error, Error::Session(code) if code == expected), "{protocol}");
 	}
 }
+
+/// EXPIRED_AUTH_TOKEN is moq-transport's session code, which moq-lite reuses, so an
+/// expired credential closes with 0x18 and reads back as `Expired` on every protocol.
+#[moq_net_sim::test]
+async fn expired_close_uses_the_shared_session_code() {
+	for protocol in [
+		"moq-lite-06",
+		"moq-lite-07-wip",
+		"moq-transport-14",
+		"moq-transport-17",
+		"moq-transport-22",
+	] {
+		let version: Version = protocol.parse().unwrap();
+		let pair = connect_mock(MockConnectOptions::new(version)).await;
+		pair.server.abort(moq_net::SessionError::Expired.into());
+		let error = pair.client.closed().await;
+		assert!(
+			matches!(error, Error::Session(moq_net::SessionError::Expired)),
+			"{protocol}: {error:?}"
+		);
+		let (code, _) = pair.client_transport.close_reason().expect("transport closed");
+		assert_eq!(code, 0x18, "{protocol}");
+	}
+}

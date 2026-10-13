@@ -190,15 +190,17 @@ impl Message for AuthError {
 	}
 }
 
-/// The REQUEST_ERROR codes AUTH_ERROR carries.
+/// The REQUEST_ERROR codes AUTH_ERROR carries, the same from draft-15 on.
 const UNAUTHORIZED: u64 = 0x1;
 const NOT_SUPPORTED: u64 = 0x3;
+const EXPIRED_AUTH_TOKEN: u64 = 0x5;
 
-/// The AUTH_ERROR code for a refusal. The public API speaks session codes, and the
-/// only distinction this registry carries is unsupported versus unauthorized.
+/// The AUTH_ERROR code for a refusal. The public API speaks session codes, and this
+/// registry distinguishes only unsupported, expired, and unauthorized.
 fn to_code(code: SessionError) -> u64 {
 	match code {
 		SessionError::Version | SessionError::Unsupported => NOT_SUPPORTED,
+		SessionError::Expired => EXPIRED_AUTH_TOKEN,
 		_ => UNAUTHORIZED,
 	}
 }
@@ -208,6 +210,7 @@ fn to_code(code: SessionError) -> u64 {
 fn from_code(code: u64) -> Error {
 	match code {
 		NOT_SUPPORTED => Error::Unsupported,
+		EXPIRED_AUTH_TOKEN => Error::Session(SessionError::Expired),
 		_ => Error::Session(SessionError::Unauthorized),
 	}
 }
@@ -750,5 +753,16 @@ mod tests {
 			Error::Session(SessionError::Unauthorized)
 		));
 		assert_eq!(to_code(SessionError::Unauthorized), UNAUTHORIZED);
+	}
+
+	/// EXPIRED_AUTH_TOKEN is the session code's REQUEST_ERROR counterpart, both ways, so
+	/// the presenter can tell a lapsed token from a refused one.
+	#[test]
+	fn expired_round_trips() {
+		assert_eq!(to_code(SessionError::Expired), EXPIRED_AUTH_TOKEN);
+		assert!(matches!(
+			from_code(EXPIRED_AUTH_TOKEN),
+			Error::Session(SessionError::Expired)
+		));
 	}
 }

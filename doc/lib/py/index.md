@@ -116,6 +116,9 @@ the simultaneous announcements or subscriptions, or ask the relay operator
 to adjust the [session limits](/bin/relay/config#session-and-peer), before
 reconnecting with the same workload.
 
+A session closed because its token expired reports the protocol kind
+`ProtocolKind.EXPIRED`. Reconnect with a fresh token; the same one is refused.
+
 ## Reference
 
 - API reference: [moq-rs.readthedocs.io](https://moq-rs.readthedocs.io)
